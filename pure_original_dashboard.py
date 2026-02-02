@@ -358,8 +358,8 @@ def render_overview(company_id, date_from, date_to):
     df = pd.DataFrame(invoices)
     
     # Bereken KPIs
-    sales_invoices = df[df['move_type'].isin(['out_invoice', 'out_refund'])]
-    purchase_invoices = df[df['move_type'].isin(['in_invoice', 'in_refund'])]
+    sales_invoices = df[df['move_type'].isin(['out_invoice', 'out_refund'])].copy()
+    purchase_invoices = df[df['move_type'].isin(['in_invoice', 'in_refund'])].copy()
     
     revenue = sales_invoices[sales_invoices['move_type'] == 'out_invoice']['amount_total'].sum()
     revenue -= sales_invoices[sales_invoices['move_type'] == 'out_refund']['amount_total'].sum()
@@ -400,8 +400,14 @@ def render_overview(company_id, date_from, date_to):
     with col2:
         st.subheader("🏢 Omzet per Entiteit")
         if not sales_invoices.empty:
-            company_rev = sales_invoices.groupby('company_id')['amount_total'].sum().reset_index()
-            company_rev['company_name'] = company_rev['company_id'].apply(lambda x: COMPANIES.get(x[0] if isinstance(x, list) else x, 'Onbekend'))
+            # Extract company ID from [id, name] list format
+            sales_invoices['company_id_num'] = sales_invoices['company_id'].apply(
+                lambda x: x[0] if isinstance(x, (list, tuple)) and len(x) > 0 else x
+            )
+            company_rev = sales_invoices.groupby('company_id_num')['amount_total'].sum().reset_index()
+            company_rev['company_name'] = company_rev['company_id_num'].apply(
+                lambda x: COMPANIES.get(x, 'Onbekend') if x else 'Onbekend'
+            )
             fig = px.pie(company_rev, values='amount_total', names='company_name',
                         color_discrete_sequence=px.colors.qualitative.Set2)
             st.plotly_chart(fig, use_container_width=True)
