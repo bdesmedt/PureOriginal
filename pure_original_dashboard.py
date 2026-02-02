@@ -256,8 +256,14 @@ def calculate_balance_sheet(lines_df, accounts_df):
     merged = lines_df.merge(accounts_df[['id', 'code', 'name', 'account_type']], 
                             left_on='account_id', right_on='id', how='left', suffixes=('', '_acc'))
     
-    # Groepeer per rekening - nu ALLE account types om resultaat te kunnen berekenen
-    balance_summary = merged.groupby(['code', 'name', 'account_type']).agg({
+    # Filter op balansrekeningen
+    balance_types = ['asset_receivable', 'asset_cash', 'asset_current', 'asset_non_current', 
+                     'asset_prepayments', 'asset_fixed', 'liability_payable', 'liability_credit_card',
+                     'liability_current', 'liability_non_current', 'equity', 'equity_unaffected']
+    balance_lines = merged[merged['account_type'].isin(balance_types)]
+    
+    # Groepeer per rekening
+    balance_summary = balance_lines.groupby(['code', 'name', 'account_type']).agg({
         'debit': 'sum',
         'credit': 'sum',
         'balance': 'sum'
@@ -739,7 +745,7 @@ def render_intercompany(company_id, date_from, date_to):
     st.markdown("---")
     st.subheader("📋 Recente IC Transacties")
     
-    recent = df.nlargest(20, 'date')[['date', 'company_name', 'account_code', 'partner_name', 'name', 'debit', 'credit']].copy()
+    recent = df.sort_values('date', ascending=False).head(20)[['date', 'company_name', 'account_code', 'partner_name', 'name', 'debit', 'credit']].copy()
     recent.columns = ['Datum', 'Entiteit', 'Rekening', 'Partner', 'Omschrijving', 'Debet', 'Credit']
     recent['Debet'] = recent['Debet'].apply(format_currency)
     recent['Credit'] = recent['Credit'].apply(format_currency)
