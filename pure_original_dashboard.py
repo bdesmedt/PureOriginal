@@ -905,31 +905,79 @@ def render_vat_analysis(company_id, date_from, date_to):
     # BTW Risico's
     st.markdown("---")
     st.subheader("⚠️ BTW Risico Signalering")
-    
-    # Check voor Belgische BTW
-    be_vat = df[df['account_name'].str.contains('BE|Belg', case=False, na=False)]
+
+    # Check voor Belgische BTW - robuuste detectie
+    # Zoek naar specifieke Belgische BTW indicatoren:
+    # - Rekeningnamen met "BTW BE", "BE BTW", "België", "Belgisch", "Belgian"
+    # - Maar NIET woorden die toevallig "BE" bevatten (BESCHRIJVING, BEREKEND, etc.)
+    be_vat_pattern = r'\bBE\s*BTW|\bBTW\s*BE\b|Belgi[ëe]|Belgisch|Belgian|\bBE\s*\d{2}%|\b21%\s*BE\b|\b6%\s*BE\b'
+    be_vat = df[df['account_name'].str.contains(be_vat_pattern, case=False, na=False, regex=True)]
+
     if not be_vat.empty:
-        be_total = be_vat['debit'].sum()
-        st.warning(f"""
-        🇧🇪 **Belgische BTW Gedetecteerd**
-        
-        Er is {format_currency(be_total)} aan Belgische BTW geboekt als voorbelasting.
-        
-        **Risico:** Belgische BTW is mogelijk niet aftrekbaar in NL zonder Belgische BTW-registratie.
-        
-        **Actie:** Controleer of P&O International een actieve Belgische BTW-registratie heeft.
-        """)
+        # Analyseer per entiteit
+        be_vat_by_company = be_vat.groupby('company_name').agg({
+            'debit': 'sum',
+            'credit': 'sum',
+            'account_name': lambda x: list(x.unique())
+        }).reset_index()
+
+        for _, row in be_vat_by_company.iterrows():
+            company_name = row['company_name']
+            be_total = row['debit']
+            matched_accounts = row['account_name']
+
+            if be_total > 0:
+                # Zoek het BTW nummer van deze entiteit
+                company_id = next((k for k, v in COMPANIES.items() if v == company_name), None)
+                company_vat = COMPANY_VAT.get(company_id, "Onbekend")
+                has_be_registration = company_vat.startswith("BE") if company_vat else False
+
+                # Toon relevante rekeningen
+                accounts_str = ", ".join(matched_accounts[:3])
+                if len(matched_accounts) > 3:
+                    accounts_str += f" (+{len(matched_accounts) - 3} meer)"
+
+                if has_be_registration:
+                    st.info(f"""
+                    🇧🇪 **Belgische BTW bij {company_name}**
+
+                    Bedrag: {format_currency(be_total)} (voorbelasting)
+
+                    Rekeningen: {accounts_str}
+
+                    **Status:** ✅ Deze entiteit heeft een Belgische BTW-registratie ({company_vat})
+                    """)
+                else:
+                    st.warning(f"""
+                    🇧🇪 **Belgische BTW Gedetecteerd bij {company_name}**
+
+                    Bedrag: {format_currency(be_total)} (voorbelasting)
+
+                    Rekeningen: {accounts_str}
+
+                    **Risico:** Belgische BTW is mogelijk niet aftrekbaar zonder Belgische BTW-registratie.
+
+                    **Huidige registratie:** {company_vat} (Nederlands)
+
+                    **Actie:** Controleer of {company_name} een actieve Belgische BTW-registratie heeft of moet aanvragen.
+                    """)
     
     # Check voor grote afwijkingen
+    has_ratio_warnings = False
     for company in df['company_name'].unique():
         company_data = df[df['company_name'] == company]
         voorbelasting = company_data[company_data['vat_category'] == 'Voorbelasting']['debit'].sum()
         af_te_dragen = company_data[company_data['vat_category'] == 'Af te dragen']['credit'].sum()
-        
+
         if voorbelasting > 0 and af_te_dragen > 0:
             ratio = voorbelasting / af_te_dragen
             if ratio > 0.5:
+                has_ratio_warnings = True
                 st.info(f"ℹ️ **{company}**: Voorbelasting/Afdracht ratio = {ratio:.1%} - Mogelijk veel inkoop of investeringen")
+
+    # Toon succesmelding als er geen risico's zijn
+    if be_vat.empty and not has_ratio_warnings:
+        st.success("✅ Geen BTW risico's gedetecteerd voor de geselecteerde periode.")
 
 # =============================================================================
 # TAB: FACTUREN
