@@ -247,6 +247,45 @@ def calculate_pl(lines_df, accounts_df):
     
     return pl_summary
 
+def get_invoice_pdf(invoice_id):
+    """Haal PDF attachment op voor een factuur"""
+    try:
+        api_key = get_api_key()
+        if not api_key:
+            return None
+        
+        # Zoek attachment voor deze factuur
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "call",
+            "params": {
+                "service": "object",
+                "method": "execute_kw",
+                "args": [
+                    ODOO_DB, ODOO_UID, api_key,
+                    "ir.attachment",
+                    "search_read",
+                    [[
+                        ["res_model", "=", "account.move"],
+                        ["res_id", "=", invoice_id],
+                        ["mimetype", "=", "application/pdf"]
+                    ]],
+                    {"fields": ["name", "datas", "mimetype"], "limit": 1}
+                ]
+            },
+            "id": 1
+        }
+        
+        response = requests.post(ODOO_URL, json=payload, timeout=30)
+        result = response.json()
+        
+        if result.get("result"):
+            return result["result"][0]
+        return None
+    except Exception as e:
+        st.error(f"Fout bij ophalen PDF: {e}")
+        return None
+
 def calculate_balance_sheet(lines_df, accounts_df):
     """Bereken Balans"""
     if lines_df.empty or accounts_df.empty:
@@ -875,6 +914,43 @@ def render_vat_analysis(company_id, date_from, date_to):
 # TAB: FACTUREN
 # =============================================================================
 
+@st.dialog("📄 Factuur PDF", width="large")
+def show_invoice_pdf_dialog(invoice_id, invoice_name):
+    """Toon factuur PDF in een popup dialog"""
+    st.write(f"**Factuur:** {invoice_name}")
+    
+    with st.spinner("PDF laden..."):
+        attachment = get_invoice_pdf(invoice_id)
+        
+        if attachment and attachment.get('datas'):
+            # PDF data is al base64 encoded vanuit Odoo
+            pdf_base64 = attachment['datas']
+            
+            # Toon PDF in iframe
+            pdf_display = f'''
+                <iframe 
+                    src="data:application/pdf;base64,{pdf_base64}" 
+                    width="100%" 
+                    height="700px" 
+                    type="application/pdf"
+                    style="border: none; border-radius: 8px;">
+                </iframe>
+            '''
+            st.markdown(pdf_display, unsafe_allow_html=True)
+            
+            # Download knop
+            import base64
+            pdf_bytes = base64.b64decode(pdf_base64)
+            st.download_button(
+                label="⬇️ Download PDF",
+                data=pdf_bytes,
+                file_name=f"{invoice_name}.pdf",
+                mime="application/pdf"
+            )
+        else:
+            st.warning("Geen PDF gevonden voor deze factuur. Mogelijk is de factuur nog niet gegenereerd of is deze handmatig verwijderd.")
+            st.info("💡 Tip: Open de factuur in Odoo en klik op 'Afdrukken' om de PDF te genereren.")
+
 def render_invoices(company_id, date_from, date_to):
     """Render Facturen drill-down tab"""
     st.header("📄 Facturen Drill-down")
@@ -936,8 +1012,36 @@ def render_invoices(company_id, date_from, date_to):
     
     st.markdown("---")
     
-    # Tabel
+    # PDF Viewer sectie
+    st.subheader("🔍 Factuur bekijken")
+    
     if not filtered.empty:
+        # Maak een selectbox met factuurnummers
+        invoice_options = {f"{row['name']} - {row['partner_id'][1] if isinstance(row['partner_id'], list) else 'N/A'} ({format_currency(row['amount_total'])})": row['id'] 
+                          for _, row in filtered.iterrows()}
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            selected_invoice = st.selectbox(
+                "Selecteer factuur om te bekijken:",
+                options=list(invoice_options.keys()),
+                index=None,
+                placeholder="Kies een factuur..."
+            )
+        
+        with col2:
+            st.write("")  # Spacer
+            st.write("")  # Spacer
+            if selected_invoice:
+                invoice_id = invoice_options[selected_invoice]
+                invoice_name = selected_invoice.split(" - ")[0]
+                if st.button("📄 Bekijk PDF", type="primary", use_container_width=True):
+                    show_invoice_pdf_dialog(invoice_id, invoice_name)
+        
+        st.markdown("---")
+        st.subheader("📋 Facturenoverzicht")
+        
+        # Tabel
         display = filtered[['name', 'partner_id', 'invoice_date', 'invoice_date_due', 
                            'move_type', 'amount_total', 'amount_residual', 'payment_state']].copy()
         display['partner_id'] = display['partner_id'].apply(lambda x: x[1] if isinstance(x, list) and len(x) > 1 else 'N/A')
