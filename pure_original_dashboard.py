@@ -686,63 +686,123 @@ def render_balance_sheet(company_id, date_from, date_to):
             st.dataframe(type_summary, use_container_width=True, hide_index=True)
     
     st.markdown("---")
-    
+
     # Kwadrant layout
     col1, col2 = st.columns(2)
-    
+
     with col1:
         st.subheader("📈 ACTIVA")
-        
-        # Vaste activa
-        fixed_types = ['asset_fixed', 'asset_non_current']
-        fixed = activa_df[activa_df['account_type'].isin(fixed_types)].copy()
-        if not fixed.empty:
-            st.markdown("**Vaste Activa**")
-            fixed['Saldo'] = fixed['debit'] - fixed['credit']
-            fixed_display = fixed[['code', 'name', 'Saldo']].sort_values('code')
+
+        # I. VASTE ACTIVA (asset_fixed, asset_non_current)
+        st.markdown("**I. Vaste Activa**")
+        fixed_assets = activa_df[activa_df['account_type'].isin(['asset_fixed', 'asset_non_current'])].copy()
+        if not fixed_assets.empty:
+            fixed_assets['Saldo'] = fixed_assets['debit'] - fixed_assets['credit']
+            fixed_display = fixed_assets[['code', 'name', 'Saldo']].sort_values('code')
             fixed_display.columns = ['Code', 'Rekening', 'Bedrag']
             fixed_display['Bedrag'] = fixed_display['Bedrag'].apply(format_currency)
             st.dataframe(fixed_display, use_container_width=True, hide_index=True)
-        
-        # Vlottende activa
-        current_types = ['asset_receivable', 'asset_cash', 'asset_current', 'asset_prepayments']
-        current = activa_df[activa_df['account_type'].isin(current_types)].copy()
-        if not current.empty:
-            st.markdown("**Vlottende Activa**")
-            current['Saldo'] = current['debit'] - current['credit']
-            current_display = current[['code', 'name', 'Saldo']].sort_values('code')
-            current_display.columns = ['Code', 'Rekening', 'Bedrag']
-            current_display['Bedrag'] = current_display['Bedrag'].apply(format_currency)
-            st.dataframe(current_display, use_container_width=True, hide_index=True)
-        
+            subtotal_fixed = fixed_assets['Saldo'].sum()
+        else:
+            subtotal_fixed = 0
+        st.markdown(f"*Subtotaal Vaste Activa: {format_currency(subtotal_fixed)}*")
+
+        # II. VLOTTENDE ACTIVA
+        st.markdown("**II. Vlottende Activa**")
+
+        # II.a Vorderingen (asset_receivable)
+        receivables = activa_df[activa_df['account_type'] == 'asset_receivable'].copy()
+        if not receivables.empty:
+            st.markdown("*Vorderingen*")
+            receivables['Saldo'] = receivables['debit'] - receivables['credit']
+            recv_display = receivables[['code', 'name', 'Saldo']].sort_values('code')
+            recv_display.columns = ['Code', 'Rekening', 'Bedrag']
+            recv_display['Bedrag'] = recv_display['Bedrag'].apply(format_currency)
+            st.dataframe(recv_display, use_container_width=True, hide_index=True)
+            subtotal_recv = receivables['Saldo'].sum()
+        else:
+            subtotal_recv = 0
+
+        # II.b Overige vlottende activa (asset_current, asset_prepayments)
+        other_current = activa_df[activa_df['account_type'].isin(['asset_current', 'asset_prepayments'])].copy()
+        if not other_current.empty:
+            st.markdown("*Overige vlottende activa*")
+            other_current['Saldo'] = other_current['debit'] - other_current['credit']
+            other_display = other_current[['code', 'name', 'Saldo']].sort_values('code')
+            other_display.columns = ['Code', 'Rekening', 'Bedrag']
+            other_display['Bedrag'] = other_display['Bedrag'].apply(format_currency)
+            st.dataframe(other_display, use_container_width=True, hide_index=True)
+            subtotal_other = other_current['Saldo'].sum()
+        else:
+            subtotal_other = 0
+
+        # II.c Liquide middelen (asset_cash)
+        cash = activa_df[activa_df['account_type'] == 'asset_cash'].copy()
+        if not cash.empty:
+            st.markdown("*Liquide middelen*")
+            cash['Saldo'] = cash['debit'] - cash['credit']
+            cash_display = cash[['code', 'name', 'Saldo']].sort_values('code')
+            cash_display.columns = ['Code', 'Rekening', 'Bedrag']
+            cash_display['Bedrag'] = cash_display['Bedrag'].apply(format_currency)
+            st.dataframe(cash_display, use_container_width=True, hide_index=True)
+            subtotal_cash = cash['Saldo'].sum()
+        else:
+            subtotal_cash = 0
+
+        subtotal_current = subtotal_recv + subtotal_other + subtotal_cash
+        st.markdown(f"*Subtotaal Vlottende Activa: {format_currency(subtotal_current)}*")
+
         st.markdown(f"### Totaal Activa: {format_currency(total_activa)}")
-    
+
     with col2:
         st.subheader("📉 PASSIVA")
-        
-        # Eigen vermogen
+
+        # I. EIGEN VERMOGEN (equity, equity_unaffected)
+        st.markdown("**I. Eigen Vermogen**")
         if not equity_df.empty:
-            st.markdown("**Eigen Vermogen**")
             equity_df['Saldo'] = equity_df['credit'] - equity_df['debit']
             equity_display = equity_df[['code', 'name', 'Saldo']].sort_values('code')
             equity_display.columns = ['Code', 'Rekening', 'Bedrag']
             equity_display['Bedrag'] = equity_display['Bedrag'].apply(format_currency)
             st.dataframe(equity_display, use_container_width=True, hide_index=True)
-        
-        # Resultaat lopend boekjaar
-        st.markdown("**Resultaat Lopend Boekjaar**")
+        st.markdown(f"*Subtotaal Eigen Vermogen: {format_currency(total_equity)}*")
+
+        # II. RESULTAAT LOPEND BOEKJAAR
+        st.markdown("**II. Resultaat Lopend Boekjaar**")
         result_color = "green" if result_year >= 0 else "red"
-        st.markdown(f"<span style='font-size:1.1em'>Resultaat: <b style='color:{result_color}'>{format_currency(result_year)}</b></span>", unsafe_allow_html=True)
-        
-        # Schulden
-        if not passiva_df.empty:
-            st.markdown("**Schulden**")
-            passiva_df['Saldo'] = passiva_df['credit'] - passiva_df['debit']
-            passiva_display = passiva_df[['code', 'name', 'Saldo']].sort_values('code')
-            passiva_display.columns = ['Code', 'Rekening', 'Bedrag']
-            passiva_display['Bedrag'] = passiva_display['Bedrag'].apply(format_currency)
-            st.dataframe(passiva_display, use_container_width=True, hide_index=True)
-        
+        st.markdown(f"<span style='font-size:1.1em'><b style='color:{result_color}'>{format_currency(result_year)}</b></span>", unsafe_allow_html=True)
+
+        # III. SCHULDEN
+        st.markdown("**III. Schulden**")
+
+        # III.a Langlopende schulden (liability_non_current)
+        long_term = passiva_df[passiva_df['account_type'] == 'liability_non_current'].copy()
+        if not long_term.empty:
+            st.markdown("*Langlopende schulden*")
+            long_term['Saldo'] = long_term['credit'] - long_term['debit']
+            long_display = long_term[['code', 'name', 'Saldo']].sort_values('code')
+            long_display.columns = ['Code', 'Rekening', 'Bedrag']
+            long_display['Bedrag'] = long_display['Bedrag'].apply(format_currency)
+            st.dataframe(long_display, use_container_width=True, hide_index=True)
+            subtotal_long = long_term['Saldo'].sum()
+        else:
+            subtotal_long = 0
+
+        # III.b Kortlopende schulden (liability_current, liability_payable, liability_credit_card)
+        short_term = passiva_df[passiva_df['account_type'].isin(['liability_current', 'liability_payable', 'liability_credit_card'])].copy()
+        if not short_term.empty:
+            st.markdown("*Kortlopende schulden*")
+            short_term['Saldo'] = short_term['credit'] - short_term['debit']
+            short_display = short_term[['code', 'name', 'Saldo']].sort_values('code')
+            short_display.columns = ['Code', 'Rekening', 'Bedrag']
+            short_display['Bedrag'] = short_display['Bedrag'].apply(format_currency)
+            st.dataframe(short_display, use_container_width=True, hide_index=True)
+            subtotal_short = short_term['Saldo'].sum()
+        else:
+            subtotal_short = 0
+
+        st.markdown(f"*Subtotaal Schulden: {format_currency(subtotal_long + subtotal_short)}*")
+
         st.markdown(f"### Totaal Passiva: {format_currency(total_passiva + total_equity + result_year)}")
 
 # =============================================================================
