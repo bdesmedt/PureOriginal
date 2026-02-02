@@ -32,7 +32,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import json
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from functools import lru_cache
 
 # =============================================================================
@@ -134,9 +134,9 @@ def get_invoices(company_id=None, date_from=None, date_to=None, limit=500):
                       "limit": limit, "order": "invoice_date desc"})
 
 @st.cache_data(ttl=300)
-def get_move_lines(domain, fields, limit=50000):
+def get_move_lines(domain, fields, limit=2000):
     """Haal boekingsregels op"""
-    return odoo_call("account.move.line", "search_read", [domain],
+    return odoo_call("account.move.line", "search_read", [domain], 
                      {"fields": fields, "limit": limit, "context": {"lang": "nl_NL"}})
 
 @st.cache_data(ttl=300)
@@ -287,29 +287,27 @@ def get_invoice_pdf(invoice_id):
         return None
 
 def calculate_balance_sheet(lines_df, accounts_df):
-    """Bereken Balans inclusief resultaat lopend boekjaar"""
+    """Bereken Balans"""
     if lines_df.empty or accounts_df.empty:
         return pd.DataFrame()
-
+    
     # Merge met accounts
-    merged = lines_df.merge(accounts_df[['id', 'code', 'name', 'account_type']],
+    merged = lines_df.merge(accounts_df[['id', 'code', 'name', 'account_type']], 
                             left_on='account_id', right_on='id', how='left', suffixes=('', '_acc'))
-
-    # Include ALL account types (balance + P&L accounts) to calculate result of the year
-    # The balance sheet needs income/expense to compute "Resultaat Lopend Boekjaar"
-    all_types = ['asset_receivable', 'asset_cash', 'asset_current', 'asset_non_current',
-                 'asset_prepayments', 'asset_fixed', 'liability_payable', 'liability_credit_card',
-                 'liability_current', 'liability_non_current', 'equity', 'equity_unaffected',
-                 'income', 'income_other', 'expense', 'expense_depreciation', 'expense_direct_cost']
-    balance_lines = merged[merged['account_type'].isin(all_types)]
-
+    
+    # Filter op balansrekeningen
+    balance_types = ['asset_receivable', 'asset_cash', 'asset_current', 'asset_non_current', 
+                     'asset_prepayments', 'asset_fixed', 'liability_payable', 'liability_credit_card',
+                     'liability_current', 'liability_non_current', 'equity', 'equity_unaffected']
+    balance_lines = merged[merged['account_type'].isin(balance_types)]
+    
     # Groepeer per rekening
     balance_summary = balance_lines.groupby(['code', 'name', 'account_type']).agg({
         'debit': 'sum',
         'credit': 'sum',
         'balance': 'sum'
     }).reset_index()
-
+    
     return balance_summary
 
 # =============================================================================
@@ -431,7 +429,7 @@ def render_overview(company_id, date_from, date_to):
     with col1:
         st.subheader("📈 Omzet per Maand")
         if not sales_invoices.empty:
-            sales_invoices['month'] = pd.to_datetime(sales_invoices['invoice_date'], errors='coerce').dt.to_period('M').astype(str)
+            sales_invoices['month'] = pd.to_datetime(sales_invoices['invoice_date']).dt.to_period('M').astype(str)
             monthly = sales_invoices.groupby('month')['amount_total'].sum().reset_index()
             fig = px.bar(monthly, x='month', y='amount_total', 
                         labels={'month': 'Maand', 'amount_total': 'Omzet (€)'},
@@ -575,74 +573,55 @@ def render_profit_loss(company_id, date_from, date_to):
 def render_balance_sheet(company_id, date_from, date_to):
     """Render Balans tab"""
     st.header("📋 Balans")
-
-    # Haal data op (balans tot einde periode) - voor activa/passiva/equity
+    
+    # Haal data op (balans tot einde periode)
     domain = []
     if company_id:
         domain.append(("company_id", "=", company_id))
     domain.append(("date", "<=", date_to))
     domain.append(("parent_state", "=", "posted"))
-
-    lines = get_move_lines(domain, ["account_id", "debit", "credit", "balance", "company_id", "date"])
+    
+    lines = get_move_lines(domain, ["account_id", "debit", "credit", "balance", "company_id"])
     accounts = get_accounts()
-
+    
     if not lines or not accounts:
         st.warning("Geen data beschikbaar")
         return
-
+    
     lines_df = pd.DataFrame(lines)
     accounts_df = pd.DataFrame(accounts)
-
+    
     # Extract account_id
     lines_df['account_id'] = lines_df['account_id'].apply(lambda x: x[0] if isinstance(x, list) else x)
-
-    # Merge met accounts voor account_type
-    merged = lines_df.merge(accounts_df[['id', 'code', 'name', 'account_type']],
-                            left_on='account_id', right_on='id', how='left', suffixes=('', '_acc'))
-
+    
+    # Bereken balans
+    balance = calculate_balance_sheet(lines_df, accounts_df)
+    
+    if balance.empty:
+        st.warning("Geen balansdata gevonden")
+        return
+    
     # Categoriseer
     activa_types = ['asset_receivable', 'asset_cash', 'asset_current', 'asset_non_current', 'asset_prepayments', 'asset_fixed']
     passiva_types = ['liability_payable', 'liability_credit_card', 'liability_current', 'liability_non_current']
     equity_types = ['equity', 'equity_unaffected']
     income_types = ['income', 'income_other']
     expense_types = ['expense', 'expense_depreciation', 'expense_direct_cost']
-
-    # Alle balansrekeningen (cumulatief tot date_to)
-    balance_types = activa_types + passiva_types + equity_types
-    balance_lines = merged[merged['account_type'].isin(balance_types)]
-
-    # Groepeer balansrekeningen per code
-    balance = balance_lines.groupby(['code', 'name', 'account_type']).agg({
-        'debit': 'sum',
-        'credit': 'sum',
-        'balance': 'sum'
-    }).reset_index()
-
-    if balance.empty:
-        st.warning("Geen balansdata gevonden")
-        return
-
-    # Aparte berekening voor income/expense - alleen huidige boekjaar (date_from tot date_to)
-    date_from_str = str(date_from)
-    pl_lines = merged[(merged['account_type'].isin(income_types + expense_types)) &
-                      (merged['date'] >= date_from_str)]
-
+    
     activa_df = balance[balance['account_type'].isin(activa_types)].copy()
     passiva_df = balance[balance['account_type'].isin(passiva_types)].copy()
     equity_df = balance[balance['account_type'].isin(equity_types)].copy()
-
-    # P&L voor huidige boekjaar
-    income_lines = pl_lines[pl_lines['account_type'].isin(income_types)]
-    expense_lines = pl_lines[pl_lines['account_type'].isin(expense_types)]
-
+    income_df = balance[balance['account_type'].isin(income_types)].copy()
+    expense_df = balance[balance['account_type'].isin(expense_types)].copy()
+    
     # Bereken saldi (activa = debit - credit, passiva/equity = credit - debit)
     total_activa = activa_df['debit'].sum() - activa_df['credit'].sum()
     total_passiva = passiva_df['credit'].sum() - passiva_df['debit'].sum()
     total_equity = equity_df['credit'].sum() - equity_df['debit'].sum()
-
-    # Bereken resultaat lopend boekjaar (income - expenses) - alleen van date_from tot date_to
-    total_income = income_lines['credit'].sum() - income_lines['debit'].sum()
-    total_expense = expense_lines['debit'].sum() - expense_lines['credit'].sum()
+    
+    # Bereken resultaat lopend boekjaar (income - expenses)
+    total_income = income_df['credit'].sum() - income_df['debit'].sum()
+    total_expense = expense_df['debit'].sum() - expense_df['credit'].sum()
     result_year = total_income - total_expense
     
     # KPIs
@@ -906,19 +885,35 @@ def render_vat_analysis(company_id, date_from, date_to):
     st.markdown("---")
     st.subheader("⚠️ BTW Risico Signalering")
     
-    # Check voor Belgische BTW
-    be_vat = df[df['account_name'].str.contains('BE|Belg', case=False, na=False)]
+    # Check voor Belgische BTW - zoek specifiek naar "Belgisch" of account 152010
+    # Let op: niet zoeken op "BE" want dat matcht met "Voorbelasting"!
+    be_vat = df[
+        (df['account_name'].str.contains('Belgisch|België', case=False, na=False)) |
+        (df['account_code'] == '152010')  # Specifieke Belgische BTW rekening
+    ]
     if not be_vat.empty:
         be_total = be_vat['debit'].sum()
-        st.warning(f"""
-        🇧🇪 **Belgische BTW Gedetecteerd**
-        
-        Er is {format_currency(be_total)} aan Belgische BTW geboekt als voorbelasting.
-        
-        **Risico:** Belgische BTW is mogelijk niet aftrekbaar in NL zonder Belgische BTW-registratie.
-        
-        **Actie:** Controleer of P&O International een actieve Belgische BTW-registratie heeft.
-        """)
+        if be_total > 0:
+            # Toon per entiteit
+            be_by_company = be_vat.groupby('company_name')['debit'].sum()
+            companies_with_be = be_by_company[be_by_company > 0]
+            
+            if not companies_with_be.empty:
+                st.warning(f"""
+                🇧🇪 **Belgische BTW Gedetecteerd**
+                
+                Er is {format_currency(be_total)} aan Belgische BTW geboekt als voorbelasting.
+                
+                **Per entiteit:**
+                """)
+                for company, amount in companies_with_be.items():
+                    st.write(f"- {company}: {format_currency(amount)}")
+                
+                st.markdown("""
+                **Risico:** Belgische BTW is mogelijk niet aftrekbaar in NL zonder Belgische BTW-registratie.
+                
+                **Actie:** Controleer of de betreffende entiteit een actieve Belgische BTW-registratie heeft.
+                """)
     
     # Check voor grote afwijkingen
     for company in df['company_name'].unique():
@@ -938,149 +933,36 @@ def render_vat_analysis(company_id, date_from, date_to):
 @st.dialog("📄 Factuur PDF", width="large")
 def show_invoice_pdf_dialog(invoice_id, invoice_name):
     """Toon factuur PDF in een popup dialog"""
-    import base64
-    import streamlit.components.v1 as components
-
     st.write(f"**Factuur:** {invoice_name}")
-
+    
     with st.spinner("PDF laden..."):
         attachment = get_invoice_pdf(invoice_id)
-
+        
         if attachment and attachment.get('datas'):
             # PDF data is al base64 encoded vanuit Odoo
             pdf_base64 = attachment['datas']
+            
+            # Toon PDF in iframe
+            pdf_display = f'''
+                <iframe 
+                    src="data:application/pdf;base64,{pdf_base64}" 
+                    width="100%" 
+                    height="700px" 
+                    type="application/pdf"
+                    style="border: none; border-radius: 8px;">
+                </iframe>
+            '''
+            st.markdown(pdf_display, unsafe_allow_html=True)
+            
+            # Download knop
+            import base64
             pdf_bytes = base64.b64decode(pdf_base64)
-
-            # Download knop bovenaan voor snelle toegang
             st.download_button(
                 label="⬇️ Download PDF",
                 data=pdf_bytes,
                 file_name=f"{invoice_name}.pdf",
-                mime="application/pdf",
-                type="primary"
+                mime="application/pdf"
             )
-
-            st.divider()
-
-            # Toon PDF met pdf.js voor betere browser compatibiliteit
-            pdf_viewer_html = f'''
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <style>
-                    body {{ margin: 0; padding: 0; }}
-                    #pdf-container {{ width: 100%; height: 650px; }}
-                    #pdf-canvas {{ width: 100%; }}
-                    .pdf-controls {{
-                        padding: 10px;
-                        background: #f0f2f6;
-                        border-radius: 8px 8px 0 0;
-                        display: flex;
-                        justify-content: center;
-                        gap: 10px;
-                        align-items: center;
-                    }}
-                    .pdf-controls button {{
-                        padding: 8px 16px;
-                        border: none;
-                        background: #ff4b4b;
-                        color: white;
-                        border-radius: 4px;
-                        cursor: pointer;
-                        font-size: 14px;
-                    }}
-                    .pdf-controls button:hover {{ background: #ff3333; }}
-                    .pdf-controls span {{ font-size: 14px; }}
-                    #pdf-viewer {{
-                        width: 100%;
-                        height: 600px;
-                        border: 1px solid #ddd;
-                        border-radius: 0 0 8px 8px;
-                        overflow: auto;
-                        background: #525659;
-                    }}
-                    canvas {{ display: block; margin: 10px auto; }}
-                </style>
-                <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-            </head>
-            <body>
-                <div id="pdf-container">
-                    <div class="pdf-controls">
-                        <button onclick="prevPage()">◀ Vorige</button>
-                        <span>Pagina <span id="page-num">1</span> / <span id="page-count">-</span></span>
-                        <button onclick="nextPage()">Volgende ▶</button>
-                        <button onclick="zoomOut()">−</button>
-                        <span id="zoom-level">100%</span>
-                        <button onclick="zoomIn()">+</button>
-                    </div>
-                    <div id="pdf-viewer">
-                        <canvas id="pdf-canvas"></canvas>
-                    </div>
-                </div>
-                <script>
-                    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-
-                    let pdfDoc = null;
-                    let pageNum = 1;
-                    let scale = 1.5;
-                    const canvas = document.getElementById('pdf-canvas');
-                    const ctx = canvas.getContext('2d');
-
-                    // Laad PDF vanuit base64
-                    const pdfData = atob("{pdf_base64}");
-                    const pdfArray = new Uint8Array(pdfData.length);
-                    for (let i = 0; i < pdfData.length; i++) {{
-                        pdfArray[i] = pdfData.charCodeAt(i);
-                    }}
-
-                    pdfjsLib.getDocument({{data: pdfArray}}).promise.then(function(pdf) {{
-                        pdfDoc = pdf;
-                        document.getElementById('page-count').textContent = pdf.numPages;
-                        renderPage(pageNum);
-                    }}).catch(function(error) {{
-                        document.getElementById('pdf-viewer').innerHTML = '<p style="color: white; text-align: center; padding: 20px;">Fout bij laden PDF: ' + error.message + '</p>';
-                    }});
-
-                    function renderPage(num) {{
-                        pdfDoc.getPage(num).then(function(page) {{
-                            const viewport = page.getViewport({{scale: scale}});
-                            canvas.height = viewport.height;
-                            canvas.width = viewport.width;
-                            page.render({{canvasContext: ctx, viewport: viewport}});
-                            document.getElementById('page-num').textContent = num;
-                        }});
-                    }}
-
-                    function prevPage() {{
-                        if (pageNum <= 1) return;
-                        pageNum--;
-                        renderPage(pageNum);
-                    }}
-
-                    function nextPage() {{
-                        if (pageNum >= pdfDoc.numPages) return;
-                        pageNum++;
-                        renderPage(pageNum);
-                    }}
-
-                    function zoomIn() {{
-                        scale += 0.25;
-                        document.getElementById('zoom-level').textContent = Math.round(scale / 1.5 * 100) + '%';
-                        renderPage(pageNum);
-                    }}
-
-                    function zoomOut() {{
-                        if (scale <= 0.5) return;
-                        scale -= 0.25;
-                        document.getElementById('zoom-level').textContent = Math.round(scale / 1.5 * 100) + '%';
-                        renderPage(pageNum);
-                    }}
-                </script>
-            </body>
-            </html>
-            '''
-
-            components.html(pdf_viewer_html, height=700, scrolling=False)
         else:
             st.warning("Geen PDF gevonden voor deze factuur. Mogelijk is de factuur nog niet gegenereerd of is deze handmatig verwijderd.")
             st.info("💡 Tip: Open de factuur in Odoo en klik op 'Afdrukken' om de PDF te genereren.")
@@ -1198,98 +1080,56 @@ def render_invoices(company_id, date_from, date_to):
 def render_bank(company_id, date_from, date_to):
     """Render Bank saldi tab"""
     st.header("🏦 Banksaldi")
-
-    # Haal closing balance (t/m einddatum)
-    domain_closing = [("account_id.account_type", "=", "asset_cash")]
+    
+    # Haal bankrekeningen en saldi op
+    domain = [("account_id.account_type", "=", "asset_cash")]
     if company_id:
-        domain_closing.append(("company_id", "=", company_id))
-    domain_closing.append(("date", "<=", date_to))
-    domain_closing.append(("parent_state", "=", "posted"))
-
-    lines_closing = get_move_lines(domain_closing, ["account_id", "debit", "credit", "balance", "company_id", "date"])
-
-    # Haal opening balance (vóór startdatum)
-    domain_opening = [("account_id.account_type", "=", "asset_cash")]
-    if company_id:
-        domain_opening.append(("company_id", "=", company_id))
-    domain_opening.append(("date", "<", date_from))
-    domain_opening.append(("parent_state", "=", "posted"))
-
-    lines_opening = get_move_lines(domain_opening, ["account_id", "debit", "credit", "balance", "company_id"])
-
-    if not lines_closing:
+        domain.append(("company_id", "=", company_id))
+    domain.append(("date", "<=", date_to))
+    domain.append(("parent_state", "=", "posted"))
+    
+    lines = get_move_lines(domain, ["account_id", "debit", "credit", "balance", "company_id"])
+    
+    if not lines:
         st.info("Geen bankgegevens gevonden")
         return
-
-    df_closing = pd.DataFrame(lines_closing)
-
+    
+    df = pd.DataFrame(lines)
+    
     # Extract info
-    df_closing['account_name'] = df_closing['account_id'].apply(lambda x: x[1] if isinstance(x, list) and len(x) > 1 else 'N/A')
-    df_closing['company_name'] = df_closing['company_id'].apply(lambda x: COMPANIES.get(x[0] if isinstance(x, list) else x, 'Onbekend'))
-
-    # Closing balance per bank per entiteit
-    summary_closing = df_closing.groupby(['company_name', 'account_name']).agg({
+    df['account_name'] = df['account_id'].apply(lambda x: x[1] if isinstance(x, list) and len(x) > 1 else 'N/A')
+    df['company_name'] = df['company_id'].apply(lambda x: COMPANIES.get(x[0] if isinstance(x, list) else x, 'Onbekend'))
+    
+    # Groepeer per bank per entiteit
+    summary = df.groupby(['company_name', 'account_name']).agg({
         'debit': 'sum',
         'credit': 'sum'
     }).reset_index()
-    summary_closing['Eindsaldo'] = summary_closing['debit'] - summary_closing['credit']
-
-    # Opening balance
-    if lines_opening:
-        df_opening = pd.DataFrame(lines_opening)
-        df_opening['account_name'] = df_opening['account_id'].apply(lambda x: x[1] if isinstance(x, list) and len(x) > 1 else 'N/A')
-        df_opening['company_name'] = df_opening['company_id'].apply(lambda x: COMPANIES.get(x[0] if isinstance(x, list) else x, 'Onbekend'))
-        summary_opening = df_opening.groupby(['company_name', 'account_name']).agg({
-            'debit': 'sum',
-            'credit': 'sum'
-        }).reset_index()
-        summary_opening['Beginsaldo'] = summary_opening['debit'] - summary_opening['credit']
-    else:
-        summary_opening = pd.DataFrame(columns=['company_name', 'account_name', 'Beginsaldo'])
-
-    # Merge opening en closing
-    summary = summary_closing[['company_name', 'account_name', 'Eindsaldo']].merge(
-        summary_opening[['company_name', 'account_name', 'Beginsaldo']],
-        on=['company_name', 'account_name'],
-        how='left'
-    )
-    summary['Beginsaldo'] = summary['Beginsaldo'].fillna(0)
-    summary['Mutatie'] = summary['Eindsaldo'] - summary['Beginsaldo']
-
-    # Totalen
-    total_opening = summary['Beginsaldo'].sum()
-    total_closing = summary['Eindsaldo'].sum()
-    total_movement = summary['Mutatie'].sum()
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("📅 Beginsaldo", format_currency(total_opening))
-    with col2:
-        st.metric("📈 Mutatie periode", format_currency(total_movement),
-                  delta="Positief" if total_movement >= 0 else "Negatief")
-    with col3:
-        st.metric("💰 Eindsaldo", format_currency(total_closing))
-
+    summary['Saldo'] = summary['debit'] - summary['credit']
+    
+    # Totaal
+    total = summary['Saldo'].sum()
+    
+    st.metric("💰 Totaal Liquide Middelen", format_currency(total))
+    
     st.markdown("---")
-
+    
     # Per entiteit
     for company in summary['company_name'].unique():
         company_data = summary[summary['company_name'] == company]
-        company_total = company_data['Eindsaldo'].sum()
-
+        company_total = company_data['Saldo'].sum()
+        
         with st.expander(f"🏢 {company} - {format_currency(company_total)}", expanded=True):
-            display = company_data[['account_name', 'Beginsaldo', 'Mutatie', 'Eindsaldo']].copy()
-            display.columns = ['Bankrekening', 'Beginsaldo', 'Mutatie', 'Eindsaldo']
-            display['Beginsaldo'] = display['Beginsaldo'].apply(format_currency)
-            display['Mutatie'] = display['Mutatie'].apply(format_currency)
-            display['Eindsaldo'] = display['Eindsaldo'].apply(format_currency)
+            display = company_data[['account_name', 'Saldo']].copy()
+            display.columns = ['Bankrekening', 'Saldo']
+            display['Saldo'] = display['Saldo'].apply(format_currency)
             st.dataframe(display, use_container_width=True, hide_index=True)
-
+    
     # Grafiek
     st.markdown("---")
-    st.subheader("📊 Verdeling Liquide Middelen (Eindsaldo)")
-
-    fig = px.pie(summary, values='Eindsaldo', names='company_name',
+    st.subheader("📊 Verdeling Liquide Middelen")
+    
+    fig = px.pie(summary, values='Saldo', names='company_name',
                 color_discrete_sequence=px.colors.qualitative.Set2,
                 title="Per Entiteit")
     st.plotly_chart(fig, use_container_width=True)
@@ -1300,181 +1140,122 @@ def render_bank(company_id, date_from, date_to):
 
 def render_cashflow(company_id, date_from, date_to):
     """Render Cashflow Prognose tab"""
-    st.header("💹 Cashflow Overzicht")
-
-    # Bepaal of historische of toekomstige view
-    today = datetime.now().date()
-    start_date = date_from if isinstance(date_from, date) else date_from.date() if hasattr(date_from, 'date') else today
-    end_date = date_to if isinstance(date_to, date) else date_to.date() if hasattr(date_to, 'date') else today
-
-    # Haal alle facturen op (niet alleen openstaande)
-    all_invoices = get_invoices(company_id, limit=10000)
-    if not all_invoices:
+    st.header("💹 Cashflow Prognose")
+    
+    # Haal openstaande facturen op
+    invoices = get_invoices(company_id, limit=2000)
+    if not invoices:
         st.warning("Geen factuurdata beschikbaar")
         return
-
-    df = pd.DataFrame(all_invoices)
-
-    # Huidig banksaldo (t/m vandaag)
-    domain = [("account_id.account_type", "=", "asset_cash"), ("parent_state", "=", "posted")]
+    
+    df = pd.DataFrame(invoices)
+    
+    # Filter op openstaand
+    open_invoices = df[df['amount_residual'] > 0].copy()
+    
+    if open_invoices.empty:
+        st.success("Geen openstaande facturen - perfecte cashflow! 🎉")
+        return
+    
+    # Huidig banksaldo
+    domain = [("account_id.account_type", "=", "asset_cash")]
     if company_id:
         domain.append(("company_id", "=", company_id))
-
-    bank_lines = get_move_lines(domain, ["debit", "credit", "date"])
+    domain.append(("parent_state", "=", "posted"))
+    
+    bank_lines = get_move_lines(domain, ["debit", "credit"])
     current_balance = sum(l['debit'] - l['credit'] for l in bank_lines) if bank_lines else 0
-
-    # Bereken banksaldo op startdatum (voor historische view)
-    if bank_lines:
-        start_date_str = start_date.strftime('%Y-%m-%d')
-        balance_at_start = sum(
-            l['debit'] - l['credit']
-            for l in bank_lines
-            if l['date'] < start_date_str
-        )
-    else:
-        balance_at_start = 0
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("🏦 Huidig Banksaldo", format_currency(current_balance))
-    with col2:
-        st.metric("📅 Saldo op startdatum", format_currency(balance_at_start))
-
+    
+    st.metric("🏦 Huidig Banksaldo", format_currency(current_balance))
+    
     st.markdown("---")
-
-    # Converteer data (errors='coerce' converts invalid values to NaT)
-    df['invoice_date'] = pd.to_datetime(df['invoice_date'], errors='coerce')
-    df['invoice_date_due'] = pd.to_datetime(df['invoice_date_due'], errors='coerce')
-
-    # Remove rows with invalid dates
-    df = df.dropna(subset=['invoice_date'])
-
-    if df.empty:
-        st.warning("Geen facturen met geldige datums gevonden")
-        return
-
+    
+    # Converteer data
+    open_invoices['invoice_date_due'] = pd.to_datetime(open_invoices['invoice_date_due'])
+    
     # Categoriseer als inkomend of uitgaand
-    df['type'] = df['move_type'].apply(
+    open_invoices['type'] = open_invoices['move_type'].apply(
         lambda x: 'Inkomend' if x in ['out_invoice'] else 'Uitgaand' if x in ['in_invoice'] else 'Overig'
     )
-
-    # Filter relevante facturen
-    df = df[df['type'].isin(['Inkomend', 'Uitgaand'])]
-
-    # Bereken aantal weken tussen start en eind
-    weeks_diff = max(1, (end_date - start_date).days // 7 + 1)
-    weeks_diff = min(weeks_diff, 52)  # Max 52 weken
-
-    # Cashflow per week
+    
+    # Prognose per week (12 weken vooruit)
+    today = datetime.now()
     weeks = []
-    running_balance = balance_at_start
-
-    for i in range(weeks_diff):
-        week_start = start_date + timedelta(weeks=i)
+    
+    for i in range(12):
+        week_start = today + timedelta(weeks=i)
         week_end = week_start + timedelta(days=7)
-
-        week_start_dt = pd.Timestamp(week_start)
-        week_end_dt = pd.Timestamp(week_end)
-
-        # Voor historische periodes: kijk naar betaalde facturen (amount_total - amount_residual)
-        # Voor toekomstige periodes: kijk naar verwachte betalingen op due date
-
-        if week_end <= today:
-            # Historisch: gebruik factuurdatum en bekijk betaalde bedragen
-            week_incoming = df[
-                (df['type'] == 'Inkomend') &
-                (df['invoice_date'] >= week_start_dt) &
-                (df['invoice_date'] < week_end_dt)
-            ]['amount_total'].sum()
-
-            week_outgoing = df[
-                (df['type'] == 'Uitgaand') &
-                (df['invoice_date'] >= week_start_dt) &
-                (df['invoice_date'] < week_end_dt)
-            ]['amount_total'].sum()
-
-            week_label = f"{week_start.strftime('%d-%m')}"
-        else:
-            # Toekomst: gebruik vervaldatum en openstaande bedragen
-            open_invoices = df[df['amount_residual'] > 0]
-
-            week_incoming = open_invoices[
-                (open_invoices['type'] == 'Inkomend') &
-                (open_invoices['invoice_date_due'] >= week_start_dt) &
-                (open_invoices['invoice_date_due'] < week_end_dt)
-            ]['amount_residual'].sum()
-
-            week_outgoing = open_invoices[
-                (open_invoices['type'] == 'Uitgaand') &
-                (open_invoices['invoice_date_due'] >= week_start_dt) &
-                (open_invoices['invoice_date_due'] < week_end_dt)
-            ]['amount_residual'].sum()
-
-            week_label = f"{week_start.strftime('%d-%m')} *"
-
-        netto = week_incoming - week_outgoing
-        running_balance += netto
-
+        
+        week_incoming = open_invoices[
+            (open_invoices['type'] == 'Inkomend') &
+            (open_invoices['invoice_date_due'] >= week_start) &
+            (open_invoices['invoice_date_due'] < week_end)
+        ]['amount_residual'].sum()
+        
+        week_outgoing = open_invoices[
+            (open_invoices['type'] == 'Uitgaand') &
+            (open_invoices['invoice_date_due'] >= week_start) &
+            (open_invoices['invoice_date_due'] < week_end)
+        ]['amount_residual'].sum()
+        
         weeks.append({
-            'Periode': week_label,
-            'Start': week_start.strftime('%d-%m-%Y'),
+            'Week': f"Week {i+1}",
+            'Start': week_start.strftime('%d-%m'),
             'Inkomend': week_incoming,
             'Uitgaand': -week_outgoing,
-            'Netto': netto,
-            'Cumulatief': running_balance
+            'Netto': week_incoming - week_outgoing
         })
-
+    
     weeks_df = pd.DataFrame(weeks)
-
+    weeks_df['Cumulatief'] = weeks_df['Netto'].cumsum() + current_balance
+    
     # Grafiek
     fig = go.Figure()
-
+    
     fig.add_trace(go.Bar(
-        x=weeks_df['Periode'],
+        x=weeks_df['Week'],
         y=weeks_df['Inkomend'],
         name='Inkomend',
         marker_color='green'
     ))
-
+    
     fig.add_trace(go.Bar(
-        x=weeks_df['Periode'],
+        x=weeks_df['Week'],
         y=weeks_df['Uitgaand'],
         name='Uitgaand',
         marker_color='red'
     ))
-
+    
     fig.add_trace(go.Scatter(
-        x=weeks_df['Periode'],
+        x=weeks_df['Week'],
         y=weeks_df['Cumulatief'],
-        name='Cumulatief Saldo',
+        name='Verwacht Saldo',
         line=dict(color='blue', width=3),
         mode='lines+markers'
     ))
-
+    
     fig.update_layout(
-        title=f'Cashflow Overzicht ({start_date.strftime("%d-%m-%Y")} - {end_date.strftime("%d-%m-%Y")})',
+        title='12-Weeks Cashflow Prognose',
         barmode='relative',
         yaxis_title='Bedrag (€)',
         legend=dict(orientation='h', yanchor='bottom', y=1.02)
     )
-
+    
     st.plotly_chart(fig, use_container_width=True)
-
-    st.caption("* = Toekomstige weken (prognose op basis van openstaande facturen)")
-
+    
     # Tabel
-    st.subheader("📋 Cashflow Detail")
+    st.subheader("📋 Prognose Detail")
     display_df = weeks_df.copy()
     for col in ['Inkomend', 'Uitgaand', 'Netto', 'Cumulatief']:
         display_df[col] = display_df[col].apply(format_currency)
     st.dataframe(display_df, use_container_width=True, hide_index=True)
-
+    
     # Waarschuwingen
     min_balance = weeks_df['Cumulatief'].min()
     if min_balance < 0:
-        st.error(f"⚠️ **Let op:** Negatief saldo van {format_currency(min_balance)} in de geselecteerde periode!")
-    elif current_balance > 0 and min_balance < current_balance * 0.2:
-        st.warning(f"⚠️ Laagste saldo: {format_currency(min_balance)} - plan voor liquiditeit")
+        st.error(f"⚠️ **Let op:** Verwacht negatief saldo van {format_currency(min_balance)} in de komende 12 weken!")
+    elif min_balance < current_balance * 0.2:
+        st.warning(f"⚠️ Verwacht laagste saldo: {format_currency(min_balance)} - plan voor liquiditeit")
 
 # =============================================================================
 # TAB: PRODUCTEN
