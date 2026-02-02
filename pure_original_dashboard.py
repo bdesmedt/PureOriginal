@@ -938,36 +938,149 @@ def render_vat_analysis(company_id, date_from, date_to):
 @st.dialog("📄 Factuur PDF", width="large")
 def show_invoice_pdf_dialog(invoice_id, invoice_name):
     """Toon factuur PDF in een popup dialog"""
+    import base64
+    import streamlit.components.v1 as components
+
     st.write(f"**Factuur:** {invoice_name}")
-    
+
     with st.spinner("PDF laden..."):
         attachment = get_invoice_pdf(invoice_id)
-        
+
         if attachment and attachment.get('datas'):
             # PDF data is al base64 encoded vanuit Odoo
             pdf_base64 = attachment['datas']
-            
-            # Toon PDF in iframe
-            pdf_display = f'''
-                <iframe 
-                    src="data:application/pdf;base64,{pdf_base64}" 
-                    width="100%" 
-                    height="700px" 
-                    type="application/pdf"
-                    style="border: none; border-radius: 8px;">
-                </iframe>
-            '''
-            st.markdown(pdf_display, unsafe_allow_html=True)
-            
-            # Download knop
-            import base64
             pdf_bytes = base64.b64decode(pdf_base64)
+
+            # Download knop bovenaan voor snelle toegang
             st.download_button(
                 label="⬇️ Download PDF",
                 data=pdf_bytes,
                 file_name=f"{invoice_name}.pdf",
-                mime="application/pdf"
+                mime="application/pdf",
+                type="primary"
             )
+
+            st.divider()
+
+            # Toon PDF met pdf.js voor betere browser compatibiliteit
+            pdf_viewer_html = f'''
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <style>
+                    body {{ margin: 0; padding: 0; }}
+                    #pdf-container {{ width: 100%; height: 650px; }}
+                    #pdf-canvas {{ width: 100%; }}
+                    .pdf-controls {{
+                        padding: 10px;
+                        background: #f0f2f6;
+                        border-radius: 8px 8px 0 0;
+                        display: flex;
+                        justify-content: center;
+                        gap: 10px;
+                        align-items: center;
+                    }}
+                    .pdf-controls button {{
+                        padding: 8px 16px;
+                        border: none;
+                        background: #ff4b4b;
+                        color: white;
+                        border-radius: 4px;
+                        cursor: pointer;
+                        font-size: 14px;
+                    }}
+                    .pdf-controls button:hover {{ background: #ff3333; }}
+                    .pdf-controls span {{ font-size: 14px; }}
+                    #pdf-viewer {{
+                        width: 100%;
+                        height: 600px;
+                        border: 1px solid #ddd;
+                        border-radius: 0 0 8px 8px;
+                        overflow: auto;
+                        background: #525659;
+                    }}
+                    canvas {{ display: block; margin: 10px auto; }}
+                </style>
+                <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+            </head>
+            <body>
+                <div id="pdf-container">
+                    <div class="pdf-controls">
+                        <button onclick="prevPage()">◀ Vorige</button>
+                        <span>Pagina <span id="page-num">1</span> / <span id="page-count">-</span></span>
+                        <button onclick="nextPage()">Volgende ▶</button>
+                        <button onclick="zoomOut()">−</button>
+                        <span id="zoom-level">100%</span>
+                        <button onclick="zoomIn()">+</button>
+                    </div>
+                    <div id="pdf-viewer">
+                        <canvas id="pdf-canvas"></canvas>
+                    </div>
+                </div>
+                <script>
+                    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+                    let pdfDoc = null;
+                    let pageNum = 1;
+                    let scale = 1.5;
+                    const canvas = document.getElementById('pdf-canvas');
+                    const ctx = canvas.getContext('2d');
+
+                    // Laad PDF vanuit base64
+                    const pdfData = atob("{pdf_base64}");
+                    const pdfArray = new Uint8Array(pdfData.length);
+                    for (let i = 0; i < pdfData.length; i++) {{
+                        pdfArray[i] = pdfData.charCodeAt(i);
+                    }}
+
+                    pdfjsLib.getDocument({{data: pdfArray}}).promise.then(function(pdf) {{
+                        pdfDoc = pdf;
+                        document.getElementById('page-count').textContent = pdf.numPages;
+                        renderPage(pageNum);
+                    }}).catch(function(error) {{
+                        document.getElementById('pdf-viewer').innerHTML = '<p style="color: white; text-align: center; padding: 20px;">Fout bij laden PDF: ' + error.message + '</p>';
+                    }});
+
+                    function renderPage(num) {{
+                        pdfDoc.getPage(num).then(function(page) {{
+                            const viewport = page.getViewport({{scale: scale}});
+                            canvas.height = viewport.height;
+                            canvas.width = viewport.width;
+                            page.render({{canvasContext: ctx, viewport: viewport}});
+                            document.getElementById('page-num').textContent = num;
+                        }});
+                    }}
+
+                    function prevPage() {{
+                        if (pageNum <= 1) return;
+                        pageNum--;
+                        renderPage(pageNum);
+                    }}
+
+                    function nextPage() {{
+                        if (pageNum >= pdfDoc.numPages) return;
+                        pageNum++;
+                        renderPage(pageNum);
+                    }}
+
+                    function zoomIn() {{
+                        scale += 0.25;
+                        document.getElementById('zoom-level').textContent = Math.round(scale / 1.5 * 100) + '%';
+                        renderPage(pageNum);
+                    }}
+
+                    function zoomOut() {{
+                        if (scale <= 0.5) return;
+                        scale -= 0.25;
+                        document.getElementById('zoom-level').textContent = Math.round(scale / 1.5 * 100) + '%';
+                        renderPage(pageNum);
+                    }}
+                </script>
+            </body>
+            </html>
+            '''
+
+            components.html(pdf_viewer_html, height=700, scrolling=False)
         else:
             st.warning("Geen PDF gevonden voor deze factuur. Mogelijk is de factuur nog niet gegenereerd of is deze handmatig verwijderd.")
             st.info("💡 Tip: Open de factuur in Odoo en klik op 'Afdrukken' om de PDF te genereren.")
