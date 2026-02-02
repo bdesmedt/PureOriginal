@@ -607,12 +607,21 @@ def render_balance_sheet(company_id, date_from, date_to):
     equity_types = ['equity', 'equity_unaffected']
     income_types = ['income', 'income_other']
     expense_types = ['expense', 'expense_depreciation', 'expense_direct_cost']
-    
+    off_balance_types = ['off_balance']
+
     activa_df = balance[balance['account_type'].isin(activa_types)].copy()
     passiva_df = balance[balance['account_type'].isin(passiva_types)].copy()
     equity_df = balance[balance['account_type'].isin(equity_types)].copy()
     income_df = balance[balance['account_type'].isin(income_types)].copy()
     expense_df = balance[balance['account_type'].isin(expense_types)].copy()
+
+    # Check voor niet-gecategoriseerde rekeningen
+    all_known_types = activa_types + passiva_types + equity_types + income_types + expense_types + off_balance_types
+    unknown_df = balance[~balance['account_type'].isin(all_known_types)].copy()
+    if not unknown_df.empty:
+        unknown_balance = unknown_df['debit'].sum() - unknown_df['credit'].sum()
+        if abs(unknown_balance) > 0.01:
+            st.warning(f"⚠️ Rekeningen met onbekend type gevonden (saldo: {format_currency(unknown_balance)}): {unknown_df['account_type'].unique().tolist()}")
     
     # Bereken saldi (activa = debit - credit, passiva/equity = credit - debit)
     total_activa = activa_df['debit'].sum() - activa_df['credit'].sum()
@@ -644,6 +653,37 @@ def render_balance_sheet(company_id, date_from, date_to):
             st.metric("✅ Balans Check", "Sluit")
         else:
             st.metric("⚠️ Verschil", format_currency(balance_check))
+
+    # Detail info als balans niet sluit
+    if abs(balance_check) >= 1:
+        with st.expander("🔍 Balans Diagnose", expanded=True):
+            st.markdown("**Balans vergelijking:** Activa = Passiva + Eigen Vermogen + Resultaat")
+            diag_col1, diag_col2 = st.columns(2)
+            with diag_col1:
+                st.markdown(f"- Activa: {format_currency(total_activa)}")
+            with diag_col2:
+                st.markdown(f"- Passiva + EV + Resultaat: {format_currency(total_passiva + total_equity + result_year)}")
+                st.markdown(f"  - Passiva: {format_currency(total_passiva)}")
+                st.markdown(f"  - Eigen Vermogen: {format_currency(total_equity)}")
+                st.markdown(f"  - Resultaat: {format_currency(result_year)}")
+            st.markdown(f"**Verschil:** {format_currency(balance_check)}")
+
+            # Toon alle account types en hun saldi
+            st.markdown("---")
+            st.markdown("**Saldi per rekeningtype:**")
+            type_summary = balance.groupby('account_type').agg({
+                'debit': 'sum',
+                'credit': 'sum'
+            }).reset_index()
+            type_summary['Saldo'] = type_summary.apply(
+                lambda r: r['debit'] - r['credit'] if r['account_type'] in activa_types + expense_types
+                else r['credit'] - r['debit'], axis=1
+            )
+            type_summary.columns = ['Rekeningtype', 'Debet', 'Credit', 'Saldo']
+            type_summary['Debet'] = type_summary['Debet'].apply(format_currency)
+            type_summary['Credit'] = type_summary['Credit'].apply(format_currency)
+            type_summary['Saldo'] = type_summary['Saldo'].apply(format_currency)
+            st.dataframe(type_summary, use_container_width=True, hide_index=True)
     
     st.markdown("---")
     
@@ -1141,91 +1181,132 @@ def render_bank(company_id, date_from, date_to):
 def render_cashflow(company_id, date_from, date_to):
     """Render Cashflow Prognose tab"""
     st.header("💹 Cashflow Prognose")
-    
+
+    # Configuratie sectie
+    config_col1, config_col2, config_col3 = st.columns([1, 1, 2])
+    with config_col1:
+        start_date = st.date_input(
+            "📅 Startdatum prognose",
+            value=datetime.now().date(),
+            help="Vanaf welke datum moet de cashflow prognose starten?"
+        )
+    with config_col2:
+        num_weeks = st.selectbox(
+            "📊 Aantal weken",
+            options=[4, 8, 12, 16, 24],
+            index=2,
+            help="Hoeveel weken vooruit prognose?"
+        )
+    with config_col3:
+        show_detail = st.checkbox("📋 Toon onderliggende facturen", value=False)
+
+    st.markdown("---")
+
     # Haal openstaande facturen op
     invoices = get_invoices(company_id, limit=2000)
     if not invoices:
         st.warning("Geen factuurdata beschikbaar")
         return
-    
+
     df = pd.DataFrame(invoices)
-    
+
     # Filter op openstaand
     open_invoices = df[df['amount_residual'] > 0].copy()
-    
+
     if open_invoices.empty:
         st.success("Geen openstaande facturen - perfecte cashflow! 🎉")
         return
-    
+
     # Huidig banksaldo
     domain = [("account_id.account_type", "=", "asset_cash")]
     if company_id:
         domain.append(("company_id", "=", company_id))
     domain.append(("parent_state", "=", "posted"))
-    
+
     bank_lines = get_move_lines(domain, ["debit", "credit"])
     current_balance = sum(l['debit'] - l['credit'] for l in bank_lines) if bank_lines else 0
-    
+
     st.metric("🏦 Huidig Banksaldo", format_currency(current_balance))
-    
+
     st.markdown("---")
-    
+
     # Converteer data
     open_invoices['invoice_date_due'] = pd.to_datetime(open_invoices['invoice_date_due'])
-    
+
     # Categoriseer als inkomend of uitgaand
     open_invoices['type'] = open_invoices['move_type'].apply(
         lambda x: 'Inkomend' if x in ['out_invoice'] else 'Uitgaand' if x in ['in_invoice'] else 'Overig'
     )
-    
-    # Prognose per week (12 weken vooruit)
-    today = datetime.now()
+
+    # Voeg partner naam toe voor detail weergave
+    open_invoices['partner_name'] = open_invoices['partner_id'].apply(
+        lambda x: x[1] if isinstance(x, list) and len(x) > 1 else 'Onbekend'
+    )
+
+    # Prognose per week (configureerbaar aantal weken vooruit)
+    prognose_start = datetime.combine(start_date, datetime.min.time())
     weeks = []
-    
-    for i in range(12):
-        week_start = today + timedelta(weeks=i)
+    weeks_invoices = []  # Voor detail weergave
+
+    for i in range(num_weeks):
+        week_start = prognose_start + timedelta(weeks=i)
         week_end = week_start + timedelta(days=7)
-        
-        week_incoming = open_invoices[
+
+        # Filter facturen voor deze week
+        week_incoming_invoices = open_invoices[
             (open_invoices['type'] == 'Inkomend') &
             (open_invoices['invoice_date_due'] >= week_start) &
             (open_invoices['invoice_date_due'] < week_end)
-        ]['amount_residual'].sum()
-        
-        week_outgoing = open_invoices[
+        ].copy()
+
+        week_outgoing_invoices = open_invoices[
             (open_invoices['type'] == 'Uitgaand') &
             (open_invoices['invoice_date_due'] >= week_start) &
             (open_invoices['invoice_date_due'] < week_end)
-        ]['amount_residual'].sum()
-        
+        ].copy()
+
+        week_incoming = week_incoming_invoices['amount_residual'].sum()
+        week_outgoing = week_outgoing_invoices['amount_residual'].sum()
+
         weeks.append({
             'Week': f"Week {i+1}",
             'Start': week_start.strftime('%d-%m'),
+            'Eind': week_end.strftime('%d-%m'),
             'Inkomend': week_incoming,
             'Uitgaand': -week_outgoing,
-            'Netto': week_incoming - week_outgoing
+            'Netto': week_incoming - week_outgoing,
+            'Aantal_in': len(week_incoming_invoices),
+            'Aantal_uit': len(week_outgoing_invoices)
         })
-    
+
+        # Bewaar facturen voor detail weergave
+        weeks_invoices.append({
+            'week_num': i + 1,
+            'week_label': f"Week {i+1} ({week_start.strftime('%d-%m')} - {week_end.strftime('%d-%m')})",
+            'incoming': week_incoming_invoices,
+            'outgoing': week_outgoing_invoices
+        })
+
     weeks_df = pd.DataFrame(weeks)
     weeks_df['Cumulatief'] = weeks_df['Netto'].cumsum() + current_balance
-    
+
     # Grafiek
     fig = go.Figure()
-    
+
     fig.add_trace(go.Bar(
         x=weeks_df['Week'],
         y=weeks_df['Inkomend'],
         name='Inkomend',
         marker_color='green'
     ))
-    
+
     fig.add_trace(go.Bar(
         x=weeks_df['Week'],
         y=weeks_df['Uitgaand'],
         name='Uitgaand',
         marker_color='red'
     ))
-    
+
     fig.add_trace(go.Scatter(
         x=weeks_df['Week'],
         y=weeks_df['Cumulatief'],
@@ -1233,27 +1314,85 @@ def render_cashflow(company_id, date_from, date_to):
         line=dict(color='blue', width=3),
         mode='lines+markers'
     ))
-    
+
     fig.update_layout(
-        title='12-Weeks Cashflow Prognose',
+        title=f'{num_weeks}-Weeks Cashflow Prognose (vanaf {start_date.strftime("%d-%m-%Y")})',
         barmode='relative',
         yaxis_title='Bedrag (€)',
         legend=dict(orientation='h', yanchor='bottom', y=1.02)
     )
-    
+
     st.plotly_chart(fig, use_container_width=True)
-    
+
     # Tabel
-    st.subheader("📋 Prognose Detail")
-    display_df = weeks_df.copy()
+    st.subheader("📋 Prognose Overzicht")
+    display_df = weeks_df[['Week', 'Start', 'Eind', 'Aantal_in', 'Aantal_uit', 'Inkomend', 'Uitgaand', 'Netto', 'Cumulatief']].copy()
+    display_df.columns = ['Week', 'Start', 'Eind', '# In', '# Uit', 'Inkomend', 'Uitgaand', 'Netto', 'Cumulatief']
     for col in ['Inkomend', 'Uitgaand', 'Netto', 'Cumulatief']:
         display_df[col] = display_df[col].apply(format_currency)
     st.dataframe(display_df, use_container_width=True, hide_index=True)
-    
+
+    # Detail view per week met onderliggende facturen
+    if show_detail:
+        st.markdown("---")
+        st.subheader("🔍 Factuur Details per Week")
+
+        for week_data in weeks_invoices:
+            has_invoices = not week_data['incoming'].empty or not week_data['outgoing'].empty
+            if has_invoices:
+                with st.expander(f"📅 {week_data['week_label']}", expanded=False):
+                    detail_col1, detail_col2 = st.columns(2)
+
+                    with detail_col1:
+                        st.markdown("**💚 Te ontvangen (verkoopfacturen)**")
+                        if not week_data['incoming'].empty:
+                            incoming_display = week_data['incoming'][['name', 'partner_name', 'invoice_date_due', 'amount_residual']].copy()
+                            incoming_display.columns = ['Factuur', 'Klant', 'Vervaldatum', 'Openstaand']
+                            incoming_display['Vervaldatum'] = incoming_display['Vervaldatum'].dt.strftime('%d-%m-%Y')
+                            incoming_display['Openstaand'] = incoming_display['Openstaand'].apply(format_currency)
+                            st.dataframe(incoming_display, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("Geen te ontvangen facturen deze week")
+
+                    with detail_col2:
+                        st.markdown("**🔴 Te betalen (inkoopfacturen)**")
+                        if not week_data['outgoing'].empty:
+                            outgoing_display = week_data['outgoing'][['name', 'partner_name', 'invoice_date_due', 'amount_residual']].copy()
+                            outgoing_display.columns = ['Factuur', 'Leverancier', 'Vervaldatum', 'Openstaand']
+                            outgoing_display['Vervaldatum'] = outgoing_display['Vervaldatum'].dt.strftime('%d-%m-%Y')
+                            outgoing_display['Openstaand'] = outgoing_display['Openstaand'].apply(format_currency)
+                            st.dataframe(outgoing_display, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("Geen te betalen facturen deze week")
+
+    # Facturen zonder vervaldatum of buiten prognose periode
+    st.markdown("---")
+    prognose_end = prognose_start + timedelta(weeks=num_weeks)
+    overdue = open_invoices[open_invoices['invoice_date_due'] < prognose_start].copy()
+    future = open_invoices[open_invoices['invoice_date_due'] >= prognose_end].copy()
+
+    if not overdue.empty:
+        with st.expander(f"⚠️ Achterstallige facturen (vóór {start_date.strftime('%d-%m-%Y')}) - {len(overdue)} facturen", expanded=True):
+            overdue_incoming = overdue[overdue['type'] == 'Inkomend']['amount_residual'].sum()
+            overdue_outgoing = overdue[overdue['type'] == 'Uitgaand']['amount_residual'].sum()
+            st.markdown(f"**Te ontvangen:** {format_currency(overdue_incoming)} | **Te betalen:** {format_currency(overdue_outgoing)}")
+            if show_detail:
+                overdue_display = overdue[['name', 'partner_name', 'type', 'invoice_date_due', 'amount_residual']].copy()
+                overdue_display.columns = ['Factuur', 'Relatie', 'Type', 'Vervaldatum', 'Openstaand']
+                overdue_display['Vervaldatum'] = overdue_display['Vervaldatum'].dt.strftime('%d-%m-%Y')
+                overdue_display['Openstaand'] = overdue_display['Openstaand'].apply(format_currency)
+                st.dataframe(overdue_display.sort_values('Vervaldatum'), use_container_width=True, hide_index=True)
+
+    if not future.empty:
+        with st.expander(f"📅 Facturen na prognose periode ({len(future)} facturen)", expanded=False):
+            future_incoming = future[future['type'] == 'Inkomend']['amount_residual'].sum()
+            future_outgoing = future[future['type'] == 'Uitgaand']['amount_residual'].sum()
+            st.markdown(f"**Te ontvangen:** {format_currency(future_incoming)} | **Te betalen:** {format_currency(future_outgoing)}")
+
     # Waarschuwingen
     min_balance = weeks_df['Cumulatief'].min()
     if min_balance < 0:
-        st.error(f"⚠️ **Let op:** Verwacht negatief saldo van {format_currency(min_balance)} in de komende 12 weken!")
+        st.error(f"⚠️ **Let op:** Verwacht negatief saldo van {format_currency(min_balance)} in de komende {num_weeks} weken!")
     elif min_balance < current_balance * 0.2:
         st.warning(f"⚠️ Verwacht laagste saldo: {format_currency(min_balance)} - plan voor liquiditeit")
 
