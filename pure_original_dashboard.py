@@ -225,118 +225,6 @@ def get_account_type_category(account_type):
     else:
         return 'overig'
 
-def classify_dutch_account(code):
-    """
-    Classificeer rekening op basis van Nederlands boekhoudplan.
-    Retourneert tuple: (hoofdcategorie, subcategorie, is_debit_saldo)
-
-    Nederlands boekhoudplan (RGS-compatibel):
-    - Klasse 0: Vaste activa (balans - activa)
-    - Klasse 1: Vlottende activa - vorderingen, effecten, liquide middelen (balans - activa)
-    - Klasse 2: Voorraden (balans - activa)
-    - Klasse 3: Onderhanden werk / Tussenrekeningen (balans - activa)
-    - Klasse 4: Kostensoorten (resultaat - kosten)
-    - Klasse 5: Eigen vermogen, voorzieningen en schulden (balans - passiva)
-    - Klasse 6: Indirecte kosten / Overige kosten (resultaat - kosten)
-    - Klasse 7: Opbrengsten (resultaat - opbrengsten)
-    - Klasse 8: Buitengewone baten/lasten (resultaat)
-    - Klasse 9: Kostenplaatsen / Statistische rekeningen (niet in balans)
-    """
-    if not code:
-        return ('overig', 'overig', True)
-
-    # Verwijder eventuele niet-numerieke prefixen en neem eerste cijfers
-    code_str = str(code).strip()
-    # Vind eerste numerieke deel
-    numeric_part = ''
-    for char in code_str:
-        if char.isdigit():
-            numeric_part += char
-        elif numeric_part:
-            break
-
-    if not numeric_part:
-        return ('overig', 'overig', True)
-
-    first_digit = int(numeric_part[0]) if numeric_part else 0
-    first_two = int(numeric_part[:2]) if len(numeric_part) >= 2 else first_digit * 10
-
-    # Klasse 0: Vaste activa
-    if first_digit == 0:
-        if first_two >= 0 and first_two <= 3:  # 00-03: Immateriële vaste activa
-            return ('activa', 'immateriele_activa', True)
-        elif first_two >= 4 and first_two <= 6:  # 04-06: Materiële vaste activa
-            return ('activa', 'materiele_activa', True)
-        else:  # 07-09: Financiële vaste activa
-            return ('activa', 'financiele_activa', True)
-
-    # Klasse 1: Vlottende activa (vorderingen, effecten, liquide middelen)
-    if first_digit == 1:
-        if first_two >= 10 and first_two <= 13:  # 10-13: Vorderingen
-            return ('activa', 'vorderingen', True)
-        elif first_two >= 14 and first_two <= 16:  # 14-16: Effecten
-            return ('activa', 'effecten', True)
-        else:  # 17-19: Liquide middelen
-            return ('activa', 'liquide_middelen', True)
-
-    # Klasse 2: Voorraden
-    if first_digit == 2:
-        return ('activa', 'voorraden', True)
-
-    # Klasse 3: Onderhanden werk / Overlopende activa
-    if first_digit == 3:
-        return ('activa', 'onderhanden_werk', True)
-
-    # Klasse 4: Kostensoorten (niet in balans)
-    if first_digit == 4:
-        return ('resultaat', 'kosten', True)
-
-    # Klasse 5: Eigen vermogen, voorzieningen en schulden
-    if first_digit == 5:
-        if first_two >= 50 and first_two <= 54:  # 50-54: Eigen vermogen
-            return ('passiva', 'eigen_vermogen', False)
-        elif first_two >= 55 and first_two <= 56:  # 55-56: Voorzieningen
-            return ('passiva', 'voorzieningen', False)
-        elif first_two >= 57 and first_two <= 58:  # 57-58: Langlopende schulden
-            return ('passiva', 'schulden_lang', False)
-        else:  # 59: Kortlopende schulden
-            return ('passiva', 'schulden_kort', False)
-
-    # Klasse 6: Indirecte kosten / Overige kosten (niet in balans)
-    if first_digit == 6:
-        return ('resultaat', 'kosten', True)
-
-    # Klasse 7: Opbrengsten (niet in balans)
-    if first_digit == 7:
-        return ('resultaat', 'opbrengsten', False)
-
-    # Klasse 8: Buitengewone baten/lasten (niet in balans)
-    if first_digit == 8:
-        return ('resultaat', 'buitengewoon', True)
-
-    # Klasse 9: Kostenplaatsen / Statistische rekeningen (niet in balans)
-    if first_digit == 9:
-        return ('off_balance', 'statistisch', True)
-
-    return ('overig', 'overig', True)
-
-def is_balance_sheet_account(code):
-    """Check of rekening bij de balans hoort (klasse 0-3 en 5 in NL)"""
-    if not code:
-        return False
-    code_str = str(code).strip()
-    numeric_part = ''
-    for char in code_str:
-        if char.isdigit():
-            numeric_part += char
-        elif numeric_part:
-            break
-    if not numeric_part:
-        return False
-    first_digit = int(numeric_part[0])
-    # Nederlands: 0-3 = activa, 5 = passiva (4,6,7,8 = resultaat, 9 = off-balance)
-    return first_digit in [0, 1, 2, 3, 5]
-
 def calculate_pl(lines_df, accounts_df):
     """Bereken Winst & Verlies"""
     if lines_df.empty or accounts_df.empty:
@@ -399,35 +287,27 @@ def get_invoice_pdf(invoice_id):
         return None
 
 def calculate_balance_sheet(lines_df, accounts_df):
-    """Bereken Balans op basis van Nederlands boekhoudplan (klasse 0-3 en 5)"""
+    """Bereken Balans"""
     if lines_df.empty or accounts_df.empty:
         return pd.DataFrame()
-
+    
     # Merge met accounts
-    merged = lines_df.merge(accounts_df[['id', 'code', 'name', 'account_type']],
+    merged = lines_df.merge(accounts_df[['id', 'code', 'name', 'account_type']], 
                             left_on='account_id', right_on='id', how='left', suffixes=('', '_acc'))
-
-    # Filter op balansrekeningen op basis van Nederlands boekhoudplan (code-gebaseerd)
-    # Klasse 0-3 = activa, Klasse 5 = passiva
-    merged['is_balance_account'] = merged['code'].apply(is_balance_sheet_account)
-    balance_lines = merged[merged['is_balance_account'] == True]
-
-    # Voeg Nederlandse classificatie toe
-    merged['nl_classification'] = merged['code'].apply(classify_dutch_account)
-    merged['nl_category'] = merged['nl_classification'].apply(lambda x: x[0] if x else 'overig')
-    merged['nl_subcategory'] = merged['nl_classification'].apply(lambda x: x[1] if x else 'overig')
-    merged['nl_is_debit'] = merged['nl_classification'].apply(lambda x: x[2] if x else True)
-
-    # Filter opnieuw met classificatie
-    balance_lines = merged[merged['nl_category'].isin(['activa', 'passiva'])]
-
-    # Groepeer per rekening inclusief Nederlandse classificatie
-    balance_summary = balance_lines.groupby(['code', 'name', 'account_type', 'nl_category', 'nl_subcategory', 'nl_is_debit']).agg({
+    
+    # Filter op balansrekeningen
+    balance_types = ['asset_receivable', 'asset_cash', 'asset_current', 'asset_non_current', 
+                     'asset_prepayments', 'asset_fixed', 'liability_payable', 'liability_credit_card',
+                     'liability_current', 'liability_non_current', 'equity', 'equity_unaffected']
+    balance_lines = merged[merged['account_type'].isin(balance_types)]
+    
+    # Groepeer per rekening
+    balance_summary = balance_lines.groupby(['code', 'name', 'account_type']).agg({
         'debit': 'sum',
         'credit': 'sum',
         'balance': 'sum'
     }).reset_index()
-
+    
     return balance_summary
 
 # =============================================================================
@@ -691,78 +571,68 @@ def render_profit_loss(company_id, date_from, date_to):
 # =============================================================================
 
 def render_balance_sheet(company_id, date_from, date_to):
-    """Render Balans tab - Nederlands boekhoudplan (klasse 0-3 activa, klasse 5 passiva)"""
+    """Render Balans tab"""
     st.header("📋 Balans")
-
+    
     # Haal data op (balans tot einde periode)
     domain = []
     if company_id:
         domain.append(("company_id", "=", company_id))
     domain.append(("date", "<=", date_to))
     domain.append(("parent_state", "=", "posted"))
-
+    
     lines = get_move_lines(domain, ["account_id", "debit", "credit", "balance", "company_id"])
     accounts = get_accounts()
-
+    
     if not lines or not accounts:
         st.warning("Geen data beschikbaar")
         return
-
+    
     lines_df = pd.DataFrame(lines)
     accounts_df = pd.DataFrame(accounts)
-
+    
     # Extract account_id
     lines_df['account_id'] = lines_df['account_id'].apply(lambda x: x[0] if isinstance(x, list) else x)
-
-    # Bereken balans (gebruikt nu Nederlandse classificatie op basis van rekeningcode)
+    
+    # Bereken balans
     balance = calculate_balance_sheet(lines_df, accounts_df)
-
+    
     if balance.empty:
         st.warning("Geen balansdata gevonden")
         return
+    
+    # Categoriseer
+    activa_types = ['asset_receivable', 'asset_cash', 'asset_current', 'asset_non_current', 'asset_prepayments', 'asset_fixed']
+    passiva_types = ['liability_payable', 'liability_credit_card', 'liability_current', 'liability_non_current']
+    equity_types = ['equity', 'equity_unaffected']
+    income_types = ['income', 'income_other']
+    expense_types = ['expense', 'expense_depreciation', 'expense_direct_cost']
+    off_balance_types = ['off_balance']
 
-    # Categoriseer op basis van Nederlandse classificatie (nl_category kolom)
-    activa_df = balance[balance['nl_category'] == 'activa'].copy()
-    passiva_df = balance[balance['nl_category'] == 'passiva'].copy()
+    activa_df = balance[balance['account_type'].isin(activa_types)].copy()
+    passiva_df = balance[balance['account_type'].isin(passiva_types)].copy()
+    equity_df = balance[balance['account_type'].isin(equity_types)].copy()
+    income_df = balance[balance['account_type'].isin(income_types)].copy()
+    expense_df = balance[balance['account_type'].isin(expense_types)].copy()
 
-    # Haal resultatenrekening op voor berekening resultaat lopend boekjaar
-    # Merge voor resultatenrekening (klasse 4, 6, 7)
-    merged_all = lines_df.merge(accounts_df[['id', 'code', 'name', 'account_type']],
-                                 left_on='account_id', right_on='id', how='left', suffixes=('', '_acc'))
-    merged_all['nl_classification'] = merged_all['code'].apply(classify_dutch_account)
-    merged_all['nl_category'] = merged_all['nl_classification'].apply(lambda x: x[0] if x else 'overig')
-    merged_all['nl_subcategory'] = merged_all['nl_classification'].apply(lambda x: x[1] if x else 'overig')
-
-    result_df = merged_all[merged_all['nl_category'] == 'resultaat']
-
-    # Bereken resultaat lopend boekjaar (opbrengsten - kosten)
-    # Opbrengsten: credit - debit (klasse 7)
-    # Kosten: debit - credit (klasse 4, 6)
-    opbrengsten_df = result_df[result_df['nl_subcategory'] == 'opbrengsten']
-    kosten_df = result_df[result_df['nl_subcategory'].isin(['kosten', 'buitengewoon'])]
-
-    total_opbrengsten = opbrengsten_df['credit'].sum() - opbrengsten_df['debit'].sum()
-    total_kosten = kosten_df['debit'].sum() - kosten_df['credit'].sum()
-    result_year = total_opbrengsten - total_kosten
-
-    # Bereken saldi
-    # Activa: debit - credit (klasse 0-3)
+    # Check voor niet-gecategoriseerde rekeningen
+    all_known_types = activa_types + passiva_types + equity_types + income_types + expense_types + off_balance_types
+    unknown_df = balance[~balance['account_type'].isin(all_known_types)].copy()
+    if not unknown_df.empty:
+        unknown_balance = unknown_df['debit'].sum() - unknown_df['credit'].sum()
+        if abs(unknown_balance) > 0.01:
+            st.warning(f"⚠️ Rekeningen met onbekend type gevonden (saldo: {format_currency(unknown_balance)}): {unknown_df['account_type'].unique().tolist()}")
+    
+    # Bereken saldi (activa = debit - credit, passiva/equity = credit - debit)
     total_activa = activa_df['debit'].sum() - activa_df['credit'].sum()
-
-    # Passiva subcategorieën (klasse 5)
-    eigen_vermogen_df = passiva_df[passiva_df['nl_subcategory'] == 'eigen_vermogen'].copy()
-    voorzieningen_df = passiva_df[passiva_df['nl_subcategory'] == 'voorzieningen'].copy()
-    schulden_lang_df = passiva_df[passiva_df['nl_subcategory'] == 'schulden_lang'].copy()
-    schulden_kort_df = passiva_df[passiva_df['nl_subcategory'] == 'schulden_kort'].copy()
-
-    # Passiva: credit - debit
-    total_eigen_vermogen = eigen_vermogen_df['credit'].sum() - eigen_vermogen_df['debit'].sum()
-    total_voorzieningen = voorzieningen_df['credit'].sum() - voorzieningen_df['debit'].sum()
-    total_schulden_lang = schulden_lang_df['credit'].sum() - schulden_lang_df['debit'].sum()
-    total_schulden_kort = schulden_kort_df['credit'].sum() - schulden_kort_df['debit'].sum()
-
-    total_passiva = total_eigen_vermogen + total_voorzieningen + total_schulden_lang + total_schulden_kort
-
+    total_passiva = passiva_df['credit'].sum() - passiva_df['debit'].sum()
+    total_equity = equity_df['credit'].sum() - equity_df['debit'].sum()
+    
+    # Bereken resultaat lopend boekjaar (income - expenses)
+    total_income = income_df['credit'].sum() - income_df['debit'].sum()
+    total_expense = expense_df['debit'].sum() - expense_df['credit'].sum()
+    result_year = total_income - total_expense
+    
     # KPIs
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
@@ -770,15 +640,15 @@ def render_balance_sheet(company_id, date_from, date_to):
     with col2:
         st.metric("📉 Totaal Passiva", format_currency(total_passiva))
     with col3:
-        st.metric("💎 Eigen Vermogen", format_currency(total_eigen_vermogen))
+        st.metric("💎 Eigen Vermogen", format_currency(total_equity))
     with col4:
         if result_year >= 0:
             st.metric("📊 Resultaat", format_currency(result_year), delta="Winst")
         else:
             st.metric("📊 Resultaat", format_currency(result_year), delta="Verlies")
     with col5:
-        # Balans check: Activa = Passiva + Resultaat
-        balance_check = total_activa - total_passiva - result_year
+        # Balans check: Activa = Passiva + EV + Resultaat
+        balance_check = total_activa - total_passiva - total_equity - result_year
         if abs(balance_check) < 1:
             st.metric("✅ Balans Check", "Sluit")
         else:
@@ -787,122 +657,93 @@ def render_balance_sheet(company_id, date_from, date_to):
     # Detail info als balans niet sluit
     if abs(balance_check) >= 1:
         with st.expander("🔍 Balans Diagnose", expanded=True):
-            st.markdown("**Balans vergelijking:** Activa = Passiva + Resultaat")
+            st.markdown("**Balans vergelijking:** Activa = Passiva + Eigen Vermogen + Resultaat")
             diag_col1, diag_col2 = st.columns(2)
             with diag_col1:
                 st.markdown(f"- Activa: {format_currency(total_activa)}")
             with diag_col2:
-                st.markdown(f"- Passiva + Resultaat: {format_currency(total_passiva + result_year)}")
-                st.markdown(f"  - Eigen Vermogen: {format_currency(total_eigen_vermogen)}")
-                st.markdown(f"  - Voorzieningen: {format_currency(total_voorzieningen)}")
-                st.markdown(f"  - Schulden >1 jaar: {format_currency(total_schulden_lang)}")
-                st.markdown(f"  - Schulden ≤1 jaar: {format_currency(total_schulden_kort)}")
+                st.markdown(f"- Passiva + EV + Resultaat: {format_currency(total_passiva + total_equity + result_year)}")
+                st.markdown(f"  - Passiva: {format_currency(total_passiva)}")
+                st.markdown(f"  - Eigen Vermogen: {format_currency(total_equity)}")
                 st.markdown(f"  - Resultaat: {format_currency(result_year)}")
             st.markdown(f"**Verschil:** {format_currency(balance_check)}")
 
-            # Toon alle subcategorieën en hun saldi
+            # Toon alle account types en hun saldi
             st.markdown("---")
-            st.markdown("**Saldi per subcategorie (Nederlands boekhoudplan):**")
-            type_summary = balance.groupby('nl_subcategory').agg({
+            st.markdown("**Saldi per rekeningtype:**")
+            type_summary = balance.groupby('account_type').agg({
                 'debit': 'sum',
-                'credit': 'sum',
-                'nl_is_debit': 'first'
+                'credit': 'sum'
             }).reset_index()
             type_summary['Saldo'] = type_summary.apply(
-                lambda r: r['debit'] - r['credit'] if r['nl_is_debit'] else r['credit'] - r['debit'], axis=1
+                lambda r: r['debit'] - r['credit'] if r['account_type'] in activa_types + expense_types
+                else r['credit'] - r['debit'], axis=1
             )
-            type_summary = type_summary[['nl_subcategory', 'debit', 'credit', 'Saldo']]
-            type_summary.columns = ['Subcategorie', 'Debet', 'Credit', 'Saldo']
+            type_summary.columns = ['Rekeningtype', 'Debet', 'Credit', 'Saldo']
             type_summary['Debet'] = type_summary['Debet'].apply(format_currency)
             type_summary['Credit'] = type_summary['Credit'].apply(format_currency)
             type_summary['Saldo'] = type_summary['Saldo'].apply(format_currency)
             st.dataframe(type_summary, use_container_width=True, hide_index=True)
-
+    
     st.markdown("---")
-
+    
     # Kwadrant layout
     col1, col2 = st.columns(2)
-
+    
     with col1:
         st.subheader("📈 ACTIVA")
-
-        # Vaste activa (klasse 0)
-        vaste_activa_subcats = ['immateriele_activa', 'materiele_activa', 'financiele_activa']
-        vaste_activa = activa_df[activa_df['nl_subcategory'].isin(vaste_activa_subcats)].copy()
-        if not vaste_activa.empty:
-            st.markdown("**Vaste Activa** (klasse 0)")
-            vaste_activa['Saldo'] = vaste_activa['debit'] - vaste_activa['credit']
-            vaste_display = vaste_activa[['code', 'name', 'Saldo']].sort_values('code')
-            vaste_display.columns = ['Code', 'Rekening', 'Bedrag']
-            vaste_display['Bedrag'] = vaste_display['Bedrag'].apply(format_currency)
-            st.dataframe(vaste_display, use_container_width=True, hide_index=True)
-            total_vaste = vaste_activa['Saldo'].sum()
-            st.markdown(f"*Subtotaal: {format_currency(total_vaste)}*")
-
-        # Vlottende activa (klasse 1-3)
-        vlottende_activa_subcats = ['vorderingen', 'effecten', 'liquide_middelen', 'voorraden', 'onderhanden_werk']
-        vlottende_activa = activa_df[activa_df['nl_subcategory'].isin(vlottende_activa_subcats)].copy()
-        if not vlottende_activa.empty:
-            st.markdown("**Vlottende Activa** (klasse 1-3)")
-            vlottende_activa['Saldo'] = vlottende_activa['debit'] - vlottende_activa['credit']
-            vlottende_display = vlottende_activa[['code', 'name', 'Saldo']].sort_values('code')
-            vlottende_display.columns = ['Code', 'Rekening', 'Bedrag']
-            vlottende_display['Bedrag'] = vlottende_display['Bedrag'].apply(format_currency)
-            st.dataframe(vlottende_display, use_container_width=True, hide_index=True)
-            total_vlottende = vlottende_activa['Saldo'].sum()
-            st.markdown(f"*Subtotaal: {format_currency(total_vlottende)}*")
-
+        
+        # Vaste activa
+        fixed_types = ['asset_fixed', 'asset_non_current']
+        fixed = activa_df[activa_df['account_type'].isin(fixed_types)].copy()
+        if not fixed.empty:
+            st.markdown("**Vaste Activa**")
+            fixed['Saldo'] = fixed['debit'] - fixed['credit']
+            fixed_display = fixed[['code', 'name', 'Saldo']].sort_values('code')
+            fixed_display.columns = ['Code', 'Rekening', 'Bedrag']
+            fixed_display['Bedrag'] = fixed_display['Bedrag'].apply(format_currency)
+            st.dataframe(fixed_display, use_container_width=True, hide_index=True)
+        
+        # Vlottende activa
+        current_types = ['asset_receivable', 'asset_cash', 'asset_current', 'asset_prepayments']
+        current = activa_df[activa_df['account_type'].isin(current_types)].copy()
+        if not current.empty:
+            st.markdown("**Vlottende Activa**")
+            current['Saldo'] = current['debit'] - current['credit']
+            current_display = current[['code', 'name', 'Saldo']].sort_values('code')
+            current_display.columns = ['Code', 'Rekening', 'Bedrag']
+            current_display['Bedrag'] = current_display['Bedrag'].apply(format_currency)
+            st.dataframe(current_display, use_container_width=True, hide_index=True)
+        
         st.markdown(f"### Totaal Activa: {format_currency(total_activa)}")
-
+    
     with col2:
         st.subheader("📉 PASSIVA")
-
+        
         # Eigen vermogen
-        if not eigen_vermogen_df.empty:
-            st.markdown("**Eigen Vermogen** (klasse 50-54)")
-            eigen_vermogen_df['Saldo'] = eigen_vermogen_df['credit'] - eigen_vermogen_df['debit']
-            ev_display = eigen_vermogen_df[['code', 'name', 'Saldo']].sort_values('code')
-            ev_display.columns = ['Code', 'Rekening', 'Bedrag']
-            ev_display['Bedrag'] = ev_display['Bedrag'].apply(format_currency)
-            st.dataframe(ev_display, use_container_width=True, hide_index=True)
-            st.markdown(f"*Subtotaal: {format_currency(total_eigen_vermogen)}*")
-
+        if not equity_df.empty:
+            st.markdown("**Eigen Vermogen**")
+            equity_df['Saldo'] = equity_df['credit'] - equity_df['debit']
+            equity_display = equity_df[['code', 'name', 'Saldo']].sort_values('code')
+            equity_display.columns = ['Code', 'Rekening', 'Bedrag']
+            equity_display['Bedrag'] = equity_display['Bedrag'].apply(format_currency)
+            st.dataframe(equity_display, use_container_width=True, hide_index=True)
+        
         # Resultaat lopend boekjaar
         st.markdown("**Resultaat Lopend Boekjaar**")
         result_color = "green" if result_year >= 0 else "red"
         st.markdown(f"<span style='font-size:1.1em'>Resultaat: <b style='color:{result_color}'>{format_currency(result_year)}</b></span>", unsafe_allow_html=True)
-
-        # Voorzieningen
-        if not voorzieningen_df.empty:
-            st.markdown("**Voorzieningen** (klasse 55-56)")
-            voorzieningen_df['Saldo'] = voorzieningen_df['credit'] - voorzieningen_df['debit']
-            voorz_display = voorzieningen_df[['code', 'name', 'Saldo']].sort_values('code')
-            voorz_display.columns = ['Code', 'Rekening', 'Bedrag']
-            voorz_display['Bedrag'] = voorz_display['Bedrag'].apply(format_currency)
-            st.dataframe(voorz_display, use_container_width=True, hide_index=True)
-            st.markdown(f"*Subtotaal: {format_currency(total_voorzieningen)}*")
-
-        # Langlopende schulden
-        if not schulden_lang_df.empty:
-            st.markdown("**Schulden > 1 jaar** (klasse 57-58)")
-            schulden_lang_df['Saldo'] = schulden_lang_df['credit'] - schulden_lang_df['debit']
-            lang_display = schulden_lang_df[['code', 'name', 'Saldo']].sort_values('code')
-            lang_display.columns = ['Code', 'Rekening', 'Bedrag']
-            lang_display['Bedrag'] = lang_display['Bedrag'].apply(format_currency)
-            st.dataframe(lang_display, use_container_width=True, hide_index=True)
-            st.markdown(f"*Subtotaal: {format_currency(total_schulden_lang)}*")
-
-        # Kortlopende schulden
-        if not schulden_kort_df.empty:
-            st.markdown("**Schulden ≤ 1 jaar** (klasse 59)")
-            schulden_kort_df['Saldo'] = schulden_kort_df['credit'] - schulden_kort_df['debit']
-            kort_display = schulden_kort_df[['code', 'name', 'Saldo']].sort_values('code')
-            kort_display.columns = ['Code', 'Rekening', 'Bedrag']
-            kort_display['Bedrag'] = kort_display['Bedrag'].apply(format_currency)
-            st.dataframe(kort_display, use_container_width=True, hide_index=True)
-            st.markdown(f"*Subtotaal: {format_currency(total_schulden_kort)}*")
-
-        st.markdown(f"### Totaal Passiva: {format_currency(total_passiva + result_year)}")
+        
+        # Schulden
+        if not passiva_df.empty:
+            st.markdown("**Schulden**")
+            passiva_df['Saldo'] = passiva_df['credit'] - passiva_df['debit']
+            passiva_display = passiva_df[['code', 'name', 'Saldo']].sort_values('code')
+            passiva_display.columns = ['Code', 'Rekening', 'Bedrag']
+            passiva_display['Bedrag'] = passiva_display['Bedrag'].apply(format_currency)
+            st.dataframe(passiva_display, use_container_width=True, hide_index=True)
+        
+        st.markdown(f"### Totaal Passiva: {format_currency(total_passiva + total_equity + result_year)}")
 
 # =============================================================================
 # TAB: INTERCOMPANY
