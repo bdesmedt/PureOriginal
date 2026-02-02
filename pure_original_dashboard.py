@@ -63,14 +63,14 @@ def get_api_key():
 
 COMPANIES = {
     1: "Pure & Original B.V.",
-    3: "Pure & Original International B.V.",
-    4: "Mia Colore B.V."
+    2: "Mia Colore B.V.",
+    3: "Pure & Original International B.V."
 }
 
 COMPANY_VAT = {
     1: "NL820994297B01",
-    3: "NL862809095B01",
-    4: "NL820994327B01"
+    2: "NL820994327B01",
+    3: "NL862809095B01"
 }
 
 # =============================================================================
@@ -256,14 +256,8 @@ def calculate_balance_sheet(lines_df, accounts_df):
     merged = lines_df.merge(accounts_df[['id', 'code', 'name', 'account_type']], 
                             left_on='account_id', right_on='id', how='left', suffixes=('', '_acc'))
     
-    # Filter op balansrekeningen
-    balance_types = ['asset_receivable', 'asset_cash', 'asset_current', 'asset_non_current', 
-                     'asset_prepayments', 'asset_fixed', 'liability_payable', 'liability_credit_card',
-                     'liability_current', 'liability_non_current', 'equity', 'equity_unaffected']
-    balance_lines = merged[merged['account_type'].isin(balance_types)]
-    
-    # Groepeer per rekening
-    balance_summary = balance_lines.groupby(['code', 'name', 'account_type']).agg({
+    # Groepeer per rekening - nu ALLE account types om resultaat te kunnen berekenen
+    balance_summary = merged.groupby(['code', 'name', 'account_type']).agg({
         'debit': 'sum',
         'credit': 'sum',
         'balance': 'sum'
@@ -566,18 +560,27 @@ def render_balance_sheet(company_id, date_from, date_to):
     activa_types = ['asset_receivable', 'asset_cash', 'asset_current', 'asset_non_current', 'asset_prepayments', 'asset_fixed']
     passiva_types = ['liability_payable', 'liability_credit_card', 'liability_current', 'liability_non_current']
     equity_types = ['equity', 'equity_unaffected']
+    income_types = ['income', 'income_other']
+    expense_types = ['expense', 'expense_depreciation', 'expense_direct_cost']
     
     activa_df = balance[balance['account_type'].isin(activa_types)].copy()
     passiva_df = balance[balance['account_type'].isin(passiva_types)].copy()
     equity_df = balance[balance['account_type'].isin(equity_types)].copy()
+    income_df = balance[balance['account_type'].isin(income_types)].copy()
+    expense_df = balance[balance['account_type'].isin(expense_types)].copy()
     
     # Bereken saldi (activa = debit - credit, passiva/equity = credit - debit)
     total_activa = activa_df['debit'].sum() - activa_df['credit'].sum()
     total_passiva = passiva_df['credit'].sum() - passiva_df['debit'].sum()
     total_equity = equity_df['credit'].sum() - equity_df['debit'].sum()
     
+    # Bereken resultaat lopend boekjaar (income - expenses)
+    total_income = income_df['credit'].sum() - income_df['debit'].sum()
+    total_expense = expense_df['debit'].sum() - expense_df['credit'].sum()
+    result_year = total_income - total_expense
+    
     # KPIs
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         st.metric("📈 Totaal Activa", format_currency(total_activa))
     with col2:
@@ -585,7 +588,13 @@ def render_balance_sheet(company_id, date_from, date_to):
     with col3:
         st.metric("💎 Eigen Vermogen", format_currency(total_equity))
     with col4:
-        balance_check = total_activa - total_passiva - total_equity
+        if result_year >= 0:
+            st.metric("📊 Resultaat", format_currency(result_year), delta="Winst")
+        else:
+            st.metric("📊 Resultaat", format_currency(result_year), delta="Verlies")
+    with col5:
+        # Balans check: Activa = Passiva + EV + Resultaat
+        balance_check = total_activa - total_passiva - total_equity - result_year
         if abs(balance_check) < 1:
             st.metric("✅ Balans Check", "Sluit")
         else:
@@ -635,6 +644,11 @@ def render_balance_sheet(company_id, date_from, date_to):
             equity_display['Bedrag'] = equity_display['Bedrag'].apply(format_currency)
             st.dataframe(equity_display, use_container_width=True, hide_index=True)
         
+        # Resultaat lopend boekjaar
+        st.markdown("**Resultaat Lopend Boekjaar**")
+        result_color = "green" if result_year >= 0 else "red"
+        st.markdown(f"<span style='font-size:1.1em'>Resultaat: <b style='color:{result_color}'>{format_currency(result_year)}</b></span>", unsafe_allow_html=True)
+        
         # Schulden
         if not passiva_df.empty:
             st.markdown("**Schulden**")
@@ -644,7 +658,7 @@ def render_balance_sheet(company_id, date_from, date_to):
             passiva_display['Bedrag'] = passiva_display['Bedrag'].apply(format_currency)
             st.dataframe(passiva_display, use_container_width=True, hide_index=True)
         
-        st.markdown(f"### Totaal Passiva: {format_currency(total_passiva + total_equity)}")
+        st.markdown(f"### Totaal Passiva: {format_currency(total_passiva + total_equity + result_year)}")
 
 # =============================================================================
 # TAB: INTERCOMPANY
@@ -654,11 +668,11 @@ def render_intercompany(company_id, date_from, date_to):
     """Render Intercompany Monitor tab"""
     st.header("🔄 Intercompany Monitor")
     
-    # Haal IC rekeningen op (126xxx)
-    domain = [("account_id.code", "like", "126%")]
+    # Haal IC rekeningen op (126xxx) - gebruik =like voor pattern matching
+    # Voor IC posities halen we ALLE boekingen t/m einddatum (geen startdatum filter)
+    domain = [("account_id.code", "=like", "126%"), ("parent_state", "=", "posted")]
     if company_id:
         domain.append(("company_id", "=", company_id))
-    domain.append(("date", ">=", date_from))
     domain.append(("date", "<=", date_to))
     
     lines = get_move_lines(domain, ["account_id", "partner_id", "debit", "credit", "balance", 
@@ -739,13 +753,12 @@ def render_vat_analysis(company_id, date_from, date_to):
     """Render BTW Analyse tab"""
     st.header("🧾 BTW Analyse")
     
-    # Haal BTW rekeningen op (15xxxx en 16xxxx)
-    domain = ["|", ("account_id.code", "like", "15%"), ("account_id.code", "like", "16%")]
+    # Haal BTW rekeningen op (alleen 15xxxx reeks) - gebruik =like voor pattern matching
+    domain = [("account_id.code", "=like", "15%"), ("parent_state", "=", "posted")]
     if company_id:
         domain.append(("company_id", "=", company_id))
     domain.append(("date", ">=", date_from))
     domain.append(("date", "<=", date_to))
-    domain.append(("parent_state", "=", "posted"))
     
     lines = get_move_lines(domain, ["account_id", "debit", "credit", "balance", "company_id", "date"])
     
@@ -760,16 +773,23 @@ def render_vat_analysis(company_id, date_from, date_to):
     df['account_name'] = df['account_id'].apply(lambda x: ' '.join(x[1].split()[1:]) if isinstance(x, list) and len(x) > 1 else 'N/A')
     df['company_name'] = df['company_id'].apply(lambda x: COMPANIES.get(x[0] if isinstance(x, list) else x, 'Onbekend'))
     
-    # Categoriseer BTW
+    # Categoriseer BTW (15xxxx reeks)
     def categorize_vat(code):
-        if code.startswith('151'):
-            return 'Voorbelasting'
-        elif code.startswith('152'):
+        # 1500xx = Af te dragen BTW (omzet)
+        # 1510xx = Overige BTW posities
+        # 1520xx = Voorbelasting
+        # 1530xx = Overige voorbelasting / oninbaar
+        # 1540xx = Af te dragen diensten
+        if code.startswith('1500') or code.startswith('1501') or code.startswith('1502') or code.startswith('1503') or code.startswith('1504') or code.startswith('1505') or code.startswith('1506') or code.startswith('1507') or code.startswith('1508') or code.startswith('1509'):
             return 'Af te dragen'
+        elif code.startswith('1510') or code.startswith('1511') or code.startswith('1512') or code.startswith('1513') or code.startswith('1514') or code.startswith('1515') or code.startswith('1516') or code.startswith('1517') or code.startswith('1518') or code.startswith('1519'):
+            return 'Af te dragen EU/buiten EU'
+        elif code.startswith('152'):
+            return 'Voorbelasting'
         elif code.startswith('153'):
-            return 'Te vorderen'
-        elif code.startswith('16'):
-            return 'BTW afdracht'
+            return 'Overig/correcties'
+        elif code.startswith('154'):
+            return 'Af te dragen diensten'
         else:
             return 'Overig'
     
