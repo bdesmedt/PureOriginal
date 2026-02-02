@@ -431,7 +431,7 @@ def render_overview(company_id, date_from, date_to):
     with col1:
         st.subheader("📈 Omzet per Maand")
         if not sales_invoices.empty:
-            sales_invoices['month'] = pd.to_datetime(sales_invoices['invoice_date']).dt.to_period('M').astype(str)
+            sales_invoices['month'] = pd.to_datetime(sales_invoices['invoice_date'], errors='coerce').dt.to_period('M').astype(str)
             monthly = sales_invoices.groupby('month')['amount_total'].sum().reset_index()
             fig = px.bar(monthly, x='month', y='amount_total', 
                         labels={'month': 'Maand', 'amount_total': 'Omzet (€)'},
@@ -1229,9 +1229,16 @@ def render_cashflow(company_id, date_from, date_to):
 
     st.markdown("---")
 
-    # Converteer data
-    df['invoice_date'] = pd.to_datetime(df['invoice_date'])
-    df['invoice_date_due'] = pd.to_datetime(df['invoice_date_due'])
+    # Converteer data (errors='coerce' converts invalid values to NaT)
+    df['invoice_date'] = pd.to_datetime(df['invoice_date'], errors='coerce')
+    df['invoice_date_due'] = pd.to_datetime(df['invoice_date_due'], errors='coerce')
+
+    # Remove rows with invalid dates
+    df = df.dropna(subset=['invoice_date'])
+
+    if df.empty:
+        st.warning("Geen facturen met geldige datums gevonden")
+        return
 
     # Categoriseer als inkomend of uitgaand
     df['type'] = df['move_type'].apply(
