@@ -287,27 +287,29 @@ def get_invoice_pdf(invoice_id):
         return None
 
 def calculate_balance_sheet(lines_df, accounts_df):
-    """Bereken Balans"""
+    """Bereken Balans inclusief resultaat lopend boekjaar"""
     if lines_df.empty or accounts_df.empty:
         return pd.DataFrame()
-    
+
     # Merge met accounts
-    merged = lines_df.merge(accounts_df[['id', 'code', 'name', 'account_type']], 
+    merged = lines_df.merge(accounts_df[['id', 'code', 'name', 'account_type']],
                             left_on='account_id', right_on='id', how='left', suffixes=('', '_acc'))
-    
-    # Filter op balansrekeningen
-    balance_types = ['asset_receivable', 'asset_cash', 'asset_current', 'asset_non_current', 
-                     'asset_prepayments', 'asset_fixed', 'liability_payable', 'liability_credit_card',
-                     'liability_current', 'liability_non_current', 'equity', 'equity_unaffected']
-    balance_lines = merged[merged['account_type'].isin(balance_types)]
-    
+
+    # Include ALL account types (balance + P&L accounts) to calculate result of the year
+    # The balance sheet needs income/expense to compute "Resultaat Lopend Boekjaar"
+    all_types = ['asset_receivable', 'asset_cash', 'asset_current', 'asset_non_current',
+                 'asset_prepayments', 'asset_fixed', 'liability_payable', 'liability_credit_card',
+                 'liability_current', 'liability_non_current', 'equity', 'equity_unaffected',
+                 'income', 'income_other', 'expense', 'expense_depreciation', 'expense_direct_cost']
+    balance_lines = merged[merged['account_type'].isin(all_types)]
+
     # Groepeer per rekening
     balance_summary = balance_lines.groupby(['code', 'name', 'account_type']).agg({
         'debit': 'sum',
         'credit': 'sum',
         'balance': 'sum'
     }).reset_index()
-    
+
     return balance_summary
 
 # =============================================================================
@@ -1064,56 +1066,98 @@ def render_invoices(company_id, date_from, date_to):
 def render_bank(company_id, date_from, date_to):
     """Render Bank saldi tab"""
     st.header("🏦 Banksaldi")
-    
-    # Haal bankrekeningen en saldi op
-    domain = [("account_id.account_type", "=", "asset_cash")]
+
+    # Haal closing balance (t/m einddatum)
+    domain_closing = [("account_id.account_type", "=", "asset_cash")]
     if company_id:
-        domain.append(("company_id", "=", company_id))
-    domain.append(("date", "<=", date_to))
-    domain.append(("parent_state", "=", "posted"))
-    
-    lines = get_move_lines(domain, ["account_id", "debit", "credit", "balance", "company_id"])
-    
-    if not lines:
+        domain_closing.append(("company_id", "=", company_id))
+    domain_closing.append(("date", "<=", date_to))
+    domain_closing.append(("parent_state", "=", "posted"))
+
+    lines_closing = get_move_lines(domain_closing, ["account_id", "debit", "credit", "balance", "company_id", "date"])
+
+    # Haal opening balance (vóór startdatum)
+    domain_opening = [("account_id.account_type", "=", "asset_cash")]
+    if company_id:
+        domain_opening.append(("company_id", "=", company_id))
+    domain_opening.append(("date", "<", date_from))
+    domain_opening.append(("parent_state", "=", "posted"))
+
+    lines_opening = get_move_lines(domain_opening, ["account_id", "debit", "credit", "balance", "company_id"])
+
+    if not lines_closing:
         st.info("Geen bankgegevens gevonden")
         return
-    
-    df = pd.DataFrame(lines)
-    
+
+    df_closing = pd.DataFrame(lines_closing)
+
     # Extract info
-    df['account_name'] = df['account_id'].apply(lambda x: x[1] if isinstance(x, list) and len(x) > 1 else 'N/A')
-    df['company_name'] = df['company_id'].apply(lambda x: COMPANIES.get(x[0] if isinstance(x, list) else x, 'Onbekend'))
-    
-    # Groepeer per bank per entiteit
-    summary = df.groupby(['company_name', 'account_name']).agg({
+    df_closing['account_name'] = df_closing['account_id'].apply(lambda x: x[1] if isinstance(x, list) and len(x) > 1 else 'N/A')
+    df_closing['company_name'] = df_closing['company_id'].apply(lambda x: COMPANIES.get(x[0] if isinstance(x, list) else x, 'Onbekend'))
+
+    # Closing balance per bank per entiteit
+    summary_closing = df_closing.groupby(['company_name', 'account_name']).agg({
         'debit': 'sum',
         'credit': 'sum'
     }).reset_index()
-    summary['Saldo'] = summary['debit'] - summary['credit']
-    
-    # Totaal
-    total = summary['Saldo'].sum()
-    
-    st.metric("💰 Totaal Liquide Middelen", format_currency(total))
-    
+    summary_closing['Eindsaldo'] = summary_closing['debit'] - summary_closing['credit']
+
+    # Opening balance
+    if lines_opening:
+        df_opening = pd.DataFrame(lines_opening)
+        df_opening['account_name'] = df_opening['account_id'].apply(lambda x: x[1] if isinstance(x, list) and len(x) > 1 else 'N/A')
+        df_opening['company_name'] = df_opening['company_id'].apply(lambda x: COMPANIES.get(x[0] if isinstance(x, list) else x, 'Onbekend'))
+        summary_opening = df_opening.groupby(['company_name', 'account_name']).agg({
+            'debit': 'sum',
+            'credit': 'sum'
+        }).reset_index()
+        summary_opening['Beginsaldo'] = summary_opening['debit'] - summary_opening['credit']
+    else:
+        summary_opening = pd.DataFrame(columns=['company_name', 'account_name', 'Beginsaldo'])
+
+    # Merge opening en closing
+    summary = summary_closing[['company_name', 'account_name', 'Eindsaldo']].merge(
+        summary_opening[['company_name', 'account_name', 'Beginsaldo']],
+        on=['company_name', 'account_name'],
+        how='left'
+    )
+    summary['Beginsaldo'] = summary['Beginsaldo'].fillna(0)
+    summary['Mutatie'] = summary['Eindsaldo'] - summary['Beginsaldo']
+
+    # Totalen
+    total_opening = summary['Beginsaldo'].sum()
+    total_closing = summary['Eindsaldo'].sum()
+    total_movement = summary['Mutatie'].sum()
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("📅 Beginsaldo", format_currency(total_opening))
+    with col2:
+        st.metric("📈 Mutatie periode", format_currency(total_movement),
+                  delta="Positief" if total_movement >= 0 else "Negatief")
+    with col3:
+        st.metric("💰 Eindsaldo", format_currency(total_closing))
+
     st.markdown("---")
-    
+
     # Per entiteit
     for company in summary['company_name'].unique():
         company_data = summary[summary['company_name'] == company]
-        company_total = company_data['Saldo'].sum()
-        
+        company_total = company_data['Eindsaldo'].sum()
+
         with st.expander(f"🏢 {company} - {format_currency(company_total)}", expanded=True):
-            display = company_data[['account_name', 'Saldo']].copy()
-            display.columns = ['Bankrekening', 'Saldo']
-            display['Saldo'] = display['Saldo'].apply(format_currency)
+            display = company_data[['account_name', 'Beginsaldo', 'Mutatie', 'Eindsaldo']].copy()
+            display.columns = ['Bankrekening', 'Beginsaldo', 'Mutatie', 'Eindsaldo']
+            display['Beginsaldo'] = display['Beginsaldo'].apply(format_currency)
+            display['Mutatie'] = display['Mutatie'].apply(format_currency)
+            display['Eindsaldo'] = display['Eindsaldo'].apply(format_currency)
             st.dataframe(display, use_container_width=True, hide_index=True)
-    
+
     # Grafiek
     st.markdown("---")
-    st.subheader("📊 Verdeling Liquide Middelen")
-    
-    fig = px.pie(summary, values='Saldo', names='company_name',
+    st.subheader("📊 Verdeling Liquide Middelen (Eindsaldo)")
+
+    fig = px.pie(summary, values='Eindsaldo', names='company_name',
                 color_discrete_sequence=px.colors.qualitative.Set2,
                 title="Per Entiteit")
     st.plotly_chart(fig, use_container_width=True)
@@ -1125,28 +1169,29 @@ def render_bank(company_id, date_from, date_to):
 def render_cashflow(company_id, date_from, date_to):
     """Render Cashflow Prognose tab"""
     st.header("💹 Cashflow Prognose")
-    
-    # Haal openstaande facturen op
+
+    # Haal openstaande facturen op (alle openstaande, want we kijken naar toekomstige betalingen)
     invoices = get_invoices(company_id, limit=2000)
     if not invoices:
         st.warning("Geen factuurdata beschikbaar")
         return
-    
+
     df = pd.DataFrame(invoices)
-    
+
     # Filter op openstaand
     open_invoices = df[df['amount_residual'] > 0].copy()
-    
+
     if open_invoices.empty:
         st.success("Geen openstaande facturen - perfecte cashflow! 🎉")
         return
-    
-    # Huidig banksaldo
+
+    # Huidig banksaldo (t/m geselecteerde einddatum voor consistentie)
     domain = [("account_id.account_type", "=", "asset_cash")]
     if company_id:
         domain.append(("company_id", "=", company_id))
+    domain.append(("date", "<=", date_to))
     domain.append(("parent_state", "=", "posted"))
-    
+
     bank_lines = get_move_lines(domain, ["debit", "credit"])
     current_balance = sum(l['debit'] - l['credit'] for l in bank_lines) if bank_lines else 0
     
