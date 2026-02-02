@@ -32,7 +32,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from functools import lru_cache
 
 # =============================================================================
@@ -134,9 +134,9 @@ def get_invoices(company_id=None, date_from=None, date_to=None, limit=500):
                       "limit": limit, "order": "invoice_date desc"})
 
 @st.cache_data(ttl=300)
-def get_move_lines(domain, fields, limit=2000):
+def get_move_lines(domain, fields, limit=50000):
     """Haal boekingsregels op"""
-    return odoo_call("account.move.line", "search_read", [domain], 
+    return odoo_call("account.move.line", "search_read", [domain],
                      {"fields": fields, "limit": limit, "context": {"lang": "nl_NL"}})
 
 @st.cache_data(ttl=300)
@@ -575,55 +575,74 @@ def render_profit_loss(company_id, date_from, date_to):
 def render_balance_sheet(company_id, date_from, date_to):
     """Render Balans tab"""
     st.header("📋 Balans")
-    
-    # Haal data op (balans tot einde periode)
+
+    # Haal data op (balans tot einde periode) - voor activa/passiva/equity
     domain = []
     if company_id:
         domain.append(("company_id", "=", company_id))
     domain.append(("date", "<=", date_to))
     domain.append(("parent_state", "=", "posted"))
-    
-    lines = get_move_lines(domain, ["account_id", "debit", "credit", "balance", "company_id"])
+
+    lines = get_move_lines(domain, ["account_id", "debit", "credit", "balance", "company_id", "date"])
     accounts = get_accounts()
-    
+
     if not lines or not accounts:
         st.warning("Geen data beschikbaar")
         return
-    
+
     lines_df = pd.DataFrame(lines)
     accounts_df = pd.DataFrame(accounts)
-    
+
     # Extract account_id
     lines_df['account_id'] = lines_df['account_id'].apply(lambda x: x[0] if isinstance(x, list) else x)
-    
-    # Bereken balans
-    balance = calculate_balance_sheet(lines_df, accounts_df)
-    
-    if balance.empty:
-        st.warning("Geen balansdata gevonden")
-        return
-    
+
+    # Merge met accounts voor account_type
+    merged = lines_df.merge(accounts_df[['id', 'code', 'name', 'account_type']],
+                            left_on='account_id', right_on='id', how='left', suffixes=('', '_acc'))
+
     # Categoriseer
     activa_types = ['asset_receivable', 'asset_cash', 'asset_current', 'asset_non_current', 'asset_prepayments', 'asset_fixed']
     passiva_types = ['liability_payable', 'liability_credit_card', 'liability_current', 'liability_non_current']
     equity_types = ['equity', 'equity_unaffected']
     income_types = ['income', 'income_other']
     expense_types = ['expense', 'expense_depreciation', 'expense_direct_cost']
-    
+
+    # Alle balansrekeningen (cumulatief tot date_to)
+    balance_types = activa_types + passiva_types + equity_types
+    balance_lines = merged[merged['account_type'].isin(balance_types)]
+
+    # Groepeer balansrekeningen per code
+    balance = balance_lines.groupby(['code', 'name', 'account_type']).agg({
+        'debit': 'sum',
+        'credit': 'sum',
+        'balance': 'sum'
+    }).reset_index()
+
+    if balance.empty:
+        st.warning("Geen balansdata gevonden")
+        return
+
+    # Aparte berekening voor income/expense - alleen huidige boekjaar (date_from tot date_to)
+    date_from_str = str(date_from)
+    pl_lines = merged[(merged['account_type'].isin(income_types + expense_types)) &
+                      (merged['date'] >= date_from_str)]
+
     activa_df = balance[balance['account_type'].isin(activa_types)].copy()
     passiva_df = balance[balance['account_type'].isin(passiva_types)].copy()
     equity_df = balance[balance['account_type'].isin(equity_types)].copy()
-    income_df = balance[balance['account_type'].isin(income_types)].copy()
-    expense_df = balance[balance['account_type'].isin(expense_types)].copy()
-    
+
+    # P&L voor huidige boekjaar
+    income_lines = pl_lines[pl_lines['account_type'].isin(income_types)]
+    expense_lines = pl_lines[pl_lines['account_type'].isin(expense_types)]
+
     # Bereken saldi (activa = debit - credit, passiva/equity = credit - debit)
     total_activa = activa_df['debit'].sum() - activa_df['credit'].sum()
     total_passiva = passiva_df['credit'].sum() - passiva_df['debit'].sum()
     total_equity = equity_df['credit'].sum() - equity_df['debit'].sum()
-    
-    # Bereken resultaat lopend boekjaar (income - expenses)
-    total_income = income_df['credit'].sum() - income_df['debit'].sum()
-    total_expense = expense_df['debit'].sum() - expense_df['credit'].sum()
+
+    # Bereken resultaat lopend boekjaar (income - expenses) - alleen van date_from tot date_to
+    total_income = income_lines['credit'].sum() - income_lines['debit'].sum()
+    total_expense = expense_lines['debit'].sum() - expense_lines['credit'].sum()
     result_year = total_income - total_expense
     
     # KPIs
@@ -1168,123 +1187,174 @@ def render_bank(company_id, date_from, date_to):
 
 def render_cashflow(company_id, date_from, date_to):
     """Render Cashflow Prognose tab"""
-    st.header("💹 Cashflow Prognose")
+    st.header("💹 Cashflow Overzicht")
 
-    # Haal openstaande facturen op (alle openstaande, want we kijken naar toekomstige betalingen)
-    invoices = get_invoices(company_id, limit=2000)
-    if not invoices:
+    # Bepaal of historische of toekomstige view
+    today = datetime.now().date()
+    start_date = date_from if isinstance(date_from, date) else date_from.date() if hasattr(date_from, 'date') else today
+    end_date = date_to if isinstance(date_to, date) else date_to.date() if hasattr(date_to, 'date') else today
+
+    # Haal alle facturen op (niet alleen openstaande)
+    all_invoices = get_invoices(company_id, limit=10000)
+    if not all_invoices:
         st.warning("Geen factuurdata beschikbaar")
         return
 
-    df = pd.DataFrame(invoices)
+    df = pd.DataFrame(all_invoices)
 
-    # Filter op openstaand
-    open_invoices = df[df['amount_residual'] > 0].copy()
-
-    if open_invoices.empty:
-        st.success("Geen openstaande facturen - perfecte cashflow! 🎉")
-        return
-
-    # Huidig banksaldo (t/m geselecteerde einddatum voor consistentie)
-    domain = [("account_id.account_type", "=", "asset_cash")]
+    # Huidig banksaldo (t/m vandaag)
+    domain = [("account_id.account_type", "=", "asset_cash"), ("parent_state", "=", "posted")]
     if company_id:
         domain.append(("company_id", "=", company_id))
-    domain.append(("date", "<=", date_to))
-    domain.append(("parent_state", "=", "posted"))
 
-    bank_lines = get_move_lines(domain, ["debit", "credit"])
+    bank_lines = get_move_lines(domain, ["debit", "credit", "date"])
     current_balance = sum(l['debit'] - l['credit'] for l in bank_lines) if bank_lines else 0
-    
-    st.metric("🏦 Huidig Banksaldo", format_currency(current_balance))
-    
+
+    # Bereken banksaldo op startdatum (voor historische view)
+    if bank_lines:
+        start_date_str = start_date.strftime('%Y-%m-%d')
+        balance_at_start = sum(
+            l['debit'] - l['credit']
+            for l in bank_lines
+            if l['date'] < start_date_str
+        )
+    else:
+        balance_at_start = 0
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("🏦 Huidig Banksaldo", format_currency(current_balance))
+    with col2:
+        st.metric("📅 Saldo op startdatum", format_currency(balance_at_start))
+
     st.markdown("---")
-    
+
     # Converteer data
-    open_invoices['invoice_date_due'] = pd.to_datetime(open_invoices['invoice_date_due'])
-    
+    df['invoice_date'] = pd.to_datetime(df['invoice_date'])
+    df['invoice_date_due'] = pd.to_datetime(df['invoice_date_due'])
+
     # Categoriseer als inkomend of uitgaand
-    open_invoices['type'] = open_invoices['move_type'].apply(
+    df['type'] = df['move_type'].apply(
         lambda x: 'Inkomend' if x in ['out_invoice'] else 'Uitgaand' if x in ['in_invoice'] else 'Overig'
     )
-    
-    # Prognose per week (12 weken vooruit)
-    today = datetime.now()
+
+    # Filter relevante facturen
+    df = df[df['type'].isin(['Inkomend', 'Uitgaand'])]
+
+    # Bereken aantal weken tussen start en eind
+    weeks_diff = max(1, (end_date - start_date).days // 7 + 1)
+    weeks_diff = min(weeks_diff, 52)  # Max 52 weken
+
+    # Cashflow per week
     weeks = []
-    
-    for i in range(12):
-        week_start = today + timedelta(weeks=i)
+    running_balance = balance_at_start
+
+    for i in range(weeks_diff):
+        week_start = start_date + timedelta(weeks=i)
         week_end = week_start + timedelta(days=7)
-        
-        week_incoming = open_invoices[
-            (open_invoices['type'] == 'Inkomend') &
-            (open_invoices['invoice_date_due'] >= week_start) &
-            (open_invoices['invoice_date_due'] < week_end)
-        ]['amount_residual'].sum()
-        
-        week_outgoing = open_invoices[
-            (open_invoices['type'] == 'Uitgaand') &
-            (open_invoices['invoice_date_due'] >= week_start) &
-            (open_invoices['invoice_date_due'] < week_end)
-        ]['amount_residual'].sum()
-        
+
+        week_start_dt = pd.Timestamp(week_start)
+        week_end_dt = pd.Timestamp(week_end)
+
+        # Voor historische periodes: kijk naar betaalde facturen (amount_total - amount_residual)
+        # Voor toekomstige periodes: kijk naar verwachte betalingen op due date
+
+        if week_end <= today:
+            # Historisch: gebruik factuurdatum en bekijk betaalde bedragen
+            week_incoming = df[
+                (df['type'] == 'Inkomend') &
+                (df['invoice_date'] >= week_start_dt) &
+                (df['invoice_date'] < week_end_dt)
+            ]['amount_total'].sum()
+
+            week_outgoing = df[
+                (df['type'] == 'Uitgaand') &
+                (df['invoice_date'] >= week_start_dt) &
+                (df['invoice_date'] < week_end_dt)
+            ]['amount_total'].sum()
+
+            week_label = f"{week_start.strftime('%d-%m')}"
+        else:
+            # Toekomst: gebruik vervaldatum en openstaande bedragen
+            open_invoices = df[df['amount_residual'] > 0]
+
+            week_incoming = open_invoices[
+                (open_invoices['type'] == 'Inkomend') &
+                (open_invoices['invoice_date_due'] >= week_start_dt) &
+                (open_invoices['invoice_date_due'] < week_end_dt)
+            ]['amount_residual'].sum()
+
+            week_outgoing = open_invoices[
+                (open_invoices['type'] == 'Uitgaand') &
+                (open_invoices['invoice_date_due'] >= week_start_dt) &
+                (open_invoices['invoice_date_due'] < week_end_dt)
+            ]['amount_residual'].sum()
+
+            week_label = f"{week_start.strftime('%d-%m')} *"
+
+        netto = week_incoming - week_outgoing
+        running_balance += netto
+
         weeks.append({
-            'Week': f"Week {i+1}",
-            'Start': week_start.strftime('%d-%m'),
+            'Periode': week_label,
+            'Start': week_start.strftime('%d-%m-%Y'),
             'Inkomend': week_incoming,
             'Uitgaand': -week_outgoing,
-            'Netto': week_incoming - week_outgoing
+            'Netto': netto,
+            'Cumulatief': running_balance
         })
-    
+
     weeks_df = pd.DataFrame(weeks)
-    weeks_df['Cumulatief'] = weeks_df['Netto'].cumsum() + current_balance
-    
+
     # Grafiek
     fig = go.Figure()
-    
+
     fig.add_trace(go.Bar(
-        x=weeks_df['Week'],
+        x=weeks_df['Periode'],
         y=weeks_df['Inkomend'],
         name='Inkomend',
         marker_color='green'
     ))
-    
+
     fig.add_trace(go.Bar(
-        x=weeks_df['Week'],
+        x=weeks_df['Periode'],
         y=weeks_df['Uitgaand'],
         name='Uitgaand',
         marker_color='red'
     ))
-    
+
     fig.add_trace(go.Scatter(
-        x=weeks_df['Week'],
+        x=weeks_df['Periode'],
         y=weeks_df['Cumulatief'],
-        name='Verwacht Saldo',
+        name='Cumulatief Saldo',
         line=dict(color='blue', width=3),
         mode='lines+markers'
     ))
-    
+
     fig.update_layout(
-        title='12-Weeks Cashflow Prognose',
+        title=f'Cashflow Overzicht ({start_date.strftime("%d-%m-%Y")} - {end_date.strftime("%d-%m-%Y")})',
         barmode='relative',
         yaxis_title='Bedrag (€)',
         legend=dict(orientation='h', yanchor='bottom', y=1.02)
     )
-    
+
     st.plotly_chart(fig, use_container_width=True)
-    
+
+    st.caption("* = Toekomstige weken (prognose op basis van openstaande facturen)")
+
     # Tabel
-    st.subheader("📋 Prognose Detail")
+    st.subheader("📋 Cashflow Detail")
     display_df = weeks_df.copy()
     for col in ['Inkomend', 'Uitgaand', 'Netto', 'Cumulatief']:
         display_df[col] = display_df[col].apply(format_currency)
     st.dataframe(display_df, use_container_width=True, hide_index=True)
-    
+
     # Waarschuwingen
     min_balance = weeks_df['Cumulatief'].min()
     if min_balance < 0:
-        st.error(f"⚠️ **Let op:** Verwacht negatief saldo van {format_currency(min_balance)} in de komende 12 weken!")
-    elif min_balance < current_balance * 0.2:
-        st.warning(f"⚠️ Verwacht laagste saldo: {format_currency(min_balance)} - plan voor liquiditeit")
+        st.error(f"⚠️ **Let op:** Negatief saldo van {format_currency(min_balance)} in de geselecteerde periode!")
+    elif current_balance > 0 and min_balance < current_balance * 0.2:
+        st.warning(f"⚠️ Laagste saldo: {format_currency(min_balance)} - plan voor liquiditeit")
 
 # =============================================================================
 # TAB: PRODUCTEN
