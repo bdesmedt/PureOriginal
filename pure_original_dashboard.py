@@ -295,10 +295,11 @@ def calculate_balance_sheet(lines_df, accounts_df):
     merged = lines_df.merge(accounts_df[['id', 'code', 'name', 'account_type']], 
                             left_on='account_id', right_on='id', how='left', suffixes=('', '_acc'))
     
-    # Filter op balansrekeningen
-    balance_types = ['asset_receivable', 'asset_cash', 'asset_current', 'asset_non_current', 
+    # Filter op balansrekeningen + P&L rekeningen (nodig voor resultaatberekening)
+    balance_types = ['asset_receivable', 'asset_cash', 'asset_current', 'asset_non_current',
                      'asset_prepayments', 'asset_fixed', 'liability_payable', 'liability_credit_card',
-                     'liability_current', 'liability_non_current', 'equity', 'equity_unaffected']
+                     'liability_current', 'liability_non_current', 'equity', 'equity_unaffected',
+                     'income', 'income_other', 'expense', 'expense_depreciation', 'expense_direct_cost']
     balance_lines = merged[merged['account_type'].isin(balance_types)]
     
     # Groepeer per rekening
