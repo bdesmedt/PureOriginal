@@ -300,7 +300,11 @@ def calculate_balance_sheet(lines_df, accounts_df):
                      'asset_prepayments', 'asset_fixed', 'liability_payable', 'liability_credit_card',
                      'liability_current', 'liability_non_current', 'equity', 'equity_unaffected',
                      'income', 'income_other', 'expense', 'expense_depreciation', 'expense_direct_cost']
-    balance_lines = merged[merged['account_type'].isin(balance_types)]
+
+    # Veiligheidscheck: rekeningen met codes 0-3 zijn altijd balansrekeningen (NL standaard)
+    is_balance_type = merged['account_type'].isin(balance_types)
+    is_balance_code = merged['code'].astype(str).str.match(r'^[0-3]')
+    balance_lines = merged[is_balance_type | is_balance_code]
     
     # Groepeer per rekening
     balance_summary = balance_lines.groupby(['code', 'name', 'account_type']).agg({
@@ -581,8 +585,8 @@ def render_balance_sheet(company_id, date_from, date_to):
         domain.append(("company_id", "=", company_id))
     domain.append(("date", "<=", date_to))
     domain.append(("parent_state", "=", "posted"))
-    
-    lines = get_move_lines(domain, ["account_id", "debit", "credit", "balance", "company_id"])
+
+    lines = get_move_lines(domain, ["account_id", "debit", "credit", "balance", "company_id"], limit=50000)
     accounts = get_accounts()
     
     if not lines or not accounts:
@@ -616,13 +620,26 @@ def render_balance_sheet(company_id, date_from, date_to):
     income_df = balance[balance['account_type'].isin(income_types)].copy()
     expense_df = balance[balance['account_type'].isin(expense_types)].copy()
 
-    # Check voor niet-gecategoriseerde rekeningen
+    # Veiligheidscheck: rekeningen met codes 0-3 die niet via account_type zijn gecategoriseerd
+    # NL standaard: 0=vaste activa, 1=vlottende activa, 2=kortlopende schulden, 3=voorraden (vlottende activa)
     all_known_types = activa_types + passiva_types + equity_types + income_types + expense_types + off_balance_types
     unknown_df = balance[~balance['account_type'].isin(all_known_types)].copy()
     if not unknown_df.empty:
-        unknown_balance = unknown_df['debit'].sum() - unknown_df['credit'].sum()
-        if abs(unknown_balance) > 0.01:
-            st.warning(f"⚠️ Rekeningen met onbekend type gevonden (saldo: {format_currency(unknown_balance)}): {unknown_df['account_type'].unique().tolist()}")
+        code_str = unknown_df['code'].astype(str)
+        # 0xxx en 1xxx en 3xxx → activa
+        extra_activa = unknown_df[code_str.str.match(r'^[013]')]
+        if not extra_activa.empty:
+            activa_df = pd.concat([activa_df, extra_activa])
+        # 2xxx → passiva (kortlopende schulden)
+        extra_passiva = unknown_df[code_str.str.match(r'^2')]
+        if not extra_passiva.empty:
+            passiva_df = pd.concat([passiva_df, extra_passiva])
+        # Overige onbekende rekeningen die niet in 0-3 vallen
+        remaining = unknown_df[~code_str.str.match(r'^[0-3]')]
+        if not remaining.empty:
+            remaining_balance = remaining['debit'].sum() - remaining['credit'].sum()
+            if abs(remaining_balance) > 0.01:
+                st.warning(f"⚠️ Rekeningen met onbekend type gevonden (saldo: {format_currency(remaining_balance)}): {remaining['account_type'].unique().tolist()}")
     
     # Bereken saldi (activa = debit - credit, passiva/equity = credit - debit)
     total_activa = activa_df['debit'].sum() - activa_df['credit'].sum()
