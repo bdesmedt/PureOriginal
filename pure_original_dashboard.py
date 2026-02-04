@@ -11,6 +11,7 @@ Uitgebreide versie met:
 - 🏦 Banksaldi
 - 💹 Cashflow Prognose
 - 📦 Producten & Categorieën
+- 👥 Klant Omzet Overzicht
 """
 
 import subprocess
@@ -197,6 +198,46 @@ def get_bank_accounts():
     journals = odoo_call("account.journal", "search_read", [[("type", "=", "bank")]],
                          {"fields": ["id", "name", "company_id", "default_account_id"]})
     return journals
+
+@st.cache_data(ttl=300)
+def get_customer_invoices(company_id=None, date_from=None, date_to=None, limit=5000):
+    """Haal alle verkoopfacturen op met klantdetails voor omzetanalyse"""
+    domain = [("move_type", "in", ["out_invoice", "out_refund"]), ("state", "=", "posted")]
+    if company_id:
+        domain.append(("company_id", "=", company_id))
+    if date_from:
+        domain.append(("invoice_date", ">=", date_from))
+    if date_to:
+        domain.append(("invoice_date", "<=", date_to))
+
+    return odoo_call("account.move", "search_read", [domain],
+                     {"fields": ["id", "name", "partner_id", "invoice_date", "invoice_date_due",
+                                "move_type", "amount_untaxed", "amount_tax", "amount_total",
+                                "amount_residual", "company_id", "currency_id", "payment_state",
+                                "invoice_origin"],
+                      "limit": limit, "order": "invoice_date desc"})
+
+@st.cache_data(ttl=300)
+def get_customer_invoice_lines(company_id=None, date_from=None, date_to=None, limit=10000):
+    """Haal factuurregels op met product- en klantdetails"""
+    domain = [
+        ("move_id.move_type", "in", ["out_invoice", "out_refund"]),
+        ("move_id.state", "=", "posted"),
+        ("display_type", "not in", ["line_section", "line_note"]),
+        ("exclude_from_invoice_tab", "=", False)
+    ]
+    if company_id:
+        domain.append(("company_id", "=", company_id))
+    if date_from:
+        domain.append(("date", ">=", date_from))
+    if date_to:
+        domain.append(("date", "<=", date_to))
+
+    return odoo_call("account.move.line", "search_read", [domain],
+                     {"fields": ["move_id", "partner_id", "product_id", "product_uom_id",
+                                "quantity", "price_unit", "discount", "price_subtotal",
+                                "price_total", "date", "company_id", "move_name"],
+                      "limit": limit})
 
 # =============================================================================
 # HELPER FUNCTIES
@@ -1570,6 +1611,632 @@ def render_products(company_id, date_from, date_to):
             st.dataframe(low_margin, use_container_width=True, hide_index=True)
 
 # =============================================================================
+# TAB: KLANT OMZET OVERZICHT
+# =============================================================================
+
+def render_customer_revenue(company_id, date_from, date_to):
+    """Render uitgebreid klant-omzet overzicht tab"""
+    st.header("👥 Klant Omzet Overzicht")
+
+    # -------------------------------------------------------------------------
+    # DATA OPHALEN
+    # -------------------------------------------------------------------------
+    invoices = get_customer_invoices(company_id, date_from, date_to)
+    if not invoices:
+        st.warning("Geen verkoopfacturen gevonden voor de geselecteerde periode")
+        return
+
+    df = pd.DataFrame(invoices)
+
+    # Extract partner info
+    df['partner_name'] = df['partner_id'].apply(
+        lambda x: x[1] if isinstance(x, list) and len(x) > 1 else 'Onbekend'
+    )
+    df['partner_id_num'] = df['partner_id'].apply(
+        lambda x: x[0] if isinstance(x, list) and len(x) > 0 else 0
+    )
+    df['company_name'] = df['company_id'].apply(
+        lambda x: COMPANIES.get(x[0] if isinstance(x, list) else x, 'Onbekend')
+    )
+    df['invoice_date'] = pd.to_datetime(df['invoice_date'])
+    df['invoice_date_due'] = pd.to_datetime(df['invoice_date_due'])
+
+    # Bereken netto bedragen (factuur positief, creditnota negatief)
+    df['netto_omzet'] = df.apply(
+        lambda r: r['amount_untaxed'] if r['move_type'] == 'out_invoice' else -r['amount_untaxed'], axis=1
+    )
+    df['netto_totaal'] = df.apply(
+        lambda r: r['amount_total'] if r['move_type'] == 'out_invoice' else -r['amount_total'], axis=1
+    )
+    df['netto_btw'] = df.apply(
+        lambda r: r['amount_tax'] if r['move_type'] == 'out_invoice' else -r['amount_tax'], axis=1
+    )
+
+    # -------------------------------------------------------------------------
+    # SECTIE 1: KPI DASHBOARD
+    # -------------------------------------------------------------------------
+    st.subheader("📊 Kerngetallen")
+
+    # Bereken KPIs
+    total_revenue = df['netto_omzet'].sum()
+    total_incl = df['netto_totaal'].sum()
+    total_customers = df['partner_id_num'].nunique()
+    total_invoices = len(df[df['move_type'] == 'out_invoice'])
+    total_credits = len(df[df['move_type'] == 'out_refund'])
+    avg_revenue_per_customer = total_revenue / total_customers if total_customers > 0 else 0
+    avg_invoice_value = total_revenue / total_invoices if total_invoices > 0 else 0
+    total_outstanding = df[df['amount_residual'] > 0]['amount_residual'].sum()
+    credit_ratio = total_credits / total_invoices * 100 if total_invoices > 0 else 0
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.metric("💰 Netto Omzet", format_currency(total_revenue))
+    with col2:
+        st.metric("👥 Aantal Klanten", f"{total_customers:,}")
+    with col3:
+        st.metric("📄 Facturen / Credits", f"{total_invoices} / {total_credits}")
+    with col4:
+        st.metric("📊 Gem. per Klant", format_currency(avg_revenue_per_customer))
+    with col5:
+        st.metric("📥 Openstaand", format_currency(total_outstanding))
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.metric("💶 Omzet incl. BTW", format_currency(total_incl))
+    with col2:
+        st.metric("🧾 BTW Bedrag", format_currency(df['netto_btw'].sum()))
+    with col3:
+        st.metric("📋 Gem. Factuurwaarde", format_currency(avg_invoice_value))
+    with col4:
+        paid_pct = (1 - total_outstanding / total_incl) * 100 if total_incl > 0 else 100
+        st.metric("✅ Betaald %", f"{paid_pct:.1f}%")
+    with col5:
+        st.metric("🔄 Credit Ratio", f"{credit_ratio:.1f}%")
+
+    st.markdown("---")
+
+    # -------------------------------------------------------------------------
+    # SECTIE 2: TOP KLANTEN RANKING
+    # -------------------------------------------------------------------------
+    st.subheader("🏆 Top Klanten Ranking")
+
+    # Aggregeer per klant
+    customer_summary = df.groupby(['partner_id_num', 'partner_name']).agg(
+        omzet_excl=('netto_omzet', 'sum'),
+        omzet_incl=('netto_totaal', 'sum'),
+        btw=('netto_btw', 'sum'),
+        aantal_facturen=('id', lambda x: len(df.loc[x.index][df.loc[x.index, 'move_type'] == 'out_invoice'])),
+        aantal_credits=('id', lambda x: len(df.loc[x.index][df.loc[x.index, 'move_type'] == 'out_refund'])),
+        openstaand=('amount_residual', 'sum'),
+        eerste_factuur=('invoice_date', 'min'),
+        laatste_factuur=('invoice_date', 'max'),
+    ).reset_index()
+
+    customer_summary['gem_factuur'] = customer_summary.apply(
+        lambda r: r['omzet_excl'] / r['aantal_facturen'] if r['aantal_facturen'] > 0 else 0, axis=1
+    )
+    customer_summary['omzet_aandeel'] = (customer_summary['omzet_excl'] / total_revenue * 100) if total_revenue > 0 else 0
+    customer_summary = customer_summary.sort_values('omzet_excl', ascending=False).reset_index(drop=True)
+    customer_summary['ranking'] = range(1, len(customer_summary) + 1)
+
+    # Top N selectie
+    top_n = st.selectbox("Toon top:", options=[10, 20, 30, 50, 100], index=1, key="top_n_customers")
+    top_customers = customer_summary.head(top_n)
+
+    # Bar chart - Top klanten
+    fig_top = px.bar(
+        top_customers,
+        x='partner_name',
+        y='omzet_excl',
+        title=f'Top {top_n} Klanten op Netto Omzet (excl. BTW)',
+        labels={'partner_name': 'Klant', 'omzet_excl': 'Omzet (€)'},
+        color='omzet_excl',
+        color_continuous_scale='Blues',
+        text=top_customers['omzet_excl'].apply(lambda x: format_currency(x))
+    )
+    fig_top.update_layout(xaxis_tickangle=-45, showlegend=False)
+    fig_top.update_traces(textposition='outside', textfont_size=9)
+    st.plotly_chart(fig_top, use_container_width=True)
+
+    # Detail tabel
+    with st.expander(f"📋 Detail Tabel - Top {top_n} Klanten", expanded=True):
+        display_top = top_customers[[
+            'ranking', 'partner_name', 'omzet_excl', 'omzet_incl', 'btw',
+            'aantal_facturen', 'aantal_credits', 'gem_factuur', 'openstaand',
+            'omzet_aandeel', 'eerste_factuur', 'laatste_factuur'
+        ]].copy()
+        display_top.columns = [
+            '#', 'Klant', 'Omzet Excl.', 'Omzet Incl.', 'BTW',
+            '# Facturen', '# Credits', 'Gem. Factuur', 'Openstaand',
+            'Aandeel %', 'Eerste Factuur', 'Laatste Factuur'
+        ]
+        for col in ['Omzet Excl.', 'Omzet Incl.', 'BTW', 'Gem. Factuur', 'Openstaand']:
+            display_top[col] = display_top[col].apply(format_currency)
+        display_top['Aandeel %'] = display_top['Aandeel %'].apply(lambda x: f"{x:.1f}%")
+        display_top['Eerste Factuur'] = pd.to_datetime(display_top['Eerste Factuur']).dt.strftime('%d-%m-%Y')
+        display_top['Laatste Factuur'] = pd.to_datetime(display_top['Laatste Factuur']).dt.strftime('%d-%m-%Y')
+        st.dataframe(display_top, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # -------------------------------------------------------------------------
+    # SECTIE 3: KLANT CONCENTRATIE (PARETO / 80-20 ANALYSE)
+    # -------------------------------------------------------------------------
+    st.subheader("📐 Klant Concentratie Analyse (Pareto)")
+
+    pareto = customer_summary[customer_summary['omzet_excl'] > 0].copy()
+    pareto = pareto.sort_values('omzet_excl', ascending=False).reset_index(drop=True)
+    pareto['cum_omzet'] = pareto['omzet_excl'].cumsum()
+    pareto['cum_pct'] = pareto['cum_omzet'] / pareto['omzet_excl'].sum() * 100
+    pareto['klant_pct'] = (pareto.index + 1) / len(pareto) * 100
+
+    # Bereken 80/20 drempel
+    threshold_80 = len(pareto[pareto['cum_pct'] <= 80]) + 1
+    pct_customers_80 = threshold_80 / len(pareto) * 100 if len(pareto) > 0 else 0
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("🎯 80% Omzet door", f"{threshold_80} klanten")
+    with col2:
+        st.metric("📊 Dat is", f"{pct_customers_80:.1f}% van klanten")
+    with col3:
+        top1_pct = customer_summary.iloc[0]['omzet_aandeel'] if len(customer_summary) > 0 else 0
+        st.metric("🥇 Grootste Klant", f"{top1_pct:.1f}% van omzet")
+
+    # Pareto chart
+    fig_pareto = go.Figure()
+    fig_pareto.add_trace(go.Bar(
+        x=list(range(1, len(pareto) + 1)),
+        y=pareto['omzet_excl'],
+        name='Omzet per Klant',
+        marker_color='steelblue',
+        yaxis='y'
+    ))
+    fig_pareto.add_trace(go.Scatter(
+        x=list(range(1, len(pareto) + 1)),
+        y=pareto['cum_pct'],
+        name='Cumulatief %',
+        line=dict(color='red', width=2),
+        mode='lines',
+        yaxis='y2'
+    ))
+    # 80% lijn
+    fig_pareto.add_hline(y=80, line_dash="dash", line_color="orange",
+                          annotation_text="80% grens", yref='y2')
+    fig_pareto.update_layout(
+        title='Pareto Analyse - Klant Omzet Concentratie',
+        xaxis_title='Klant Ranking (op omzet)',
+        yaxis=dict(title='Omzet (€)', side='left'),
+        yaxis2=dict(title='Cumulatief %', side='right', overlaying='y', range=[0, 105]),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02),
+        barmode='relative'
+    )
+    st.plotly_chart(fig_pareto, use_container_width=True)
+
+    # Segmentatie tabel
+    with st.expander("📊 Klantsegmentatie op basis van omzet"):
+        segments = []
+        for label, lower, upper in [
+            ('A - Top (>€50.000)', 50000, float('inf')),
+            ('B - Groot (€20.000-€50.000)', 20000, 50000),
+            ('C - Midden (€5.000-€20.000)', 5000, 20000),
+            ('D - Klein (€1.000-€5.000)', 1000, 5000),
+            ('E - Micro (<€1.000)', 0, 1000),
+        ]:
+            seg = customer_summary[
+                (customer_summary['omzet_excl'] >= lower) & (customer_summary['omzet_excl'] < upper)
+            ]
+            segments.append({
+                'Segment': label,
+                'Aantal Klanten': len(seg),
+                '% Klanten': f"{len(seg) / total_customers * 100:.1f}%" if total_customers > 0 else "0%",
+                'Totale Omzet': format_currency(seg['omzet_excl'].sum()),
+                '% Omzet': f"{seg['omzet_excl'].sum() / total_revenue * 100:.1f}%" if total_revenue > 0 else "0%",
+                'Gem. Omzet': format_currency(seg['omzet_excl'].mean()) if len(seg) > 0 else format_currency(0),
+            })
+        st.dataframe(pd.DataFrame(segments), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # -------------------------------------------------------------------------
+    # SECTIE 4: OMZET TREND PER MAAND
+    # -------------------------------------------------------------------------
+    st.subheader("📈 Omzet Trend per Maand")
+
+    df['month'] = df['invoice_date'].dt.to_period('M').astype(str)
+
+    # Totale maandelijkse omzet
+    monthly_total = df.groupby('month')['netto_omzet'].sum().reset_index()
+    monthly_total.columns = ['Maand', 'Omzet']
+
+    fig_monthly = px.bar(
+        monthly_total, x='Maand', y='Omzet',
+        title='Maandelijkse Netto Omzet',
+        labels={'Maand': 'Maand', 'Omzet': 'Omzet (€)'},
+        color_discrete_sequence=['#2196F3'],
+        text=monthly_total['Omzet'].apply(lambda x: format_currency(x))
+    )
+    fig_monthly.update_traces(textposition='outside', textfont_size=9)
+    st.plotly_chart(fig_monthly, use_container_width=True)
+
+    # Top 5 klanten per maand (stacked bar)
+    top5_ids = customer_summary.head(5)['partner_id_num'].tolist()
+    top5_names = customer_summary.head(5)['partner_name'].tolist()
+    monthly_top5 = df[df['partner_id_num'].isin(top5_ids)].groupby(
+        ['month', 'partner_name']
+    )['netto_omzet'].sum().reset_index()
+
+    if not monthly_top5.empty:
+        fig_stacked = px.bar(
+            monthly_top5, x='month', y='netto_omzet', color='partner_name',
+            title='Top 5 Klanten - Maandelijkse Omzet',
+            labels={'month': 'Maand', 'netto_omzet': 'Omzet (€)', 'partner_name': 'Klant'},
+            barmode='stack',
+            color_discrete_sequence=px.colors.qualitative.Set2
+        )
+        st.plotly_chart(fig_stacked, use_container_width=True)
+
+    st.markdown("---")
+
+    # -------------------------------------------------------------------------
+    # SECTIE 5: OMZET PER ENTITEIT PER KLANT
+    # -------------------------------------------------------------------------
+    st.subheader("🏢 Omzet per Entiteit")
+
+    entity_customer = df.groupby(['company_name', 'partner_name']).agg(
+        omzet=('netto_omzet', 'sum'),
+        facturen=('id', 'count')
+    ).reset_index()
+
+    # Sunburst chart
+    entity_customer_positive = entity_customer[entity_customer['omzet'] > 0].copy()
+    if not entity_customer_positive.empty:
+        fig_sunburst = px.sunburst(
+            entity_customer_positive.nlargest(50, 'omzet'),
+            path=['company_name', 'partner_name'],
+            values='omzet',
+            title='Omzet Verdeling per Entiteit en Klant (Top 50)',
+            color='omzet',
+            color_continuous_scale='Blues'
+        )
+        fig_sunburst.update_layout(height=600)
+        st.plotly_chart(fig_sunburst, use_container_width=True)
+
+    # Tabel per entiteit
+    for entity in sorted(df['company_name'].unique()):
+        entity_data = customer_summary.copy()
+        entity_invoices = df[df['company_name'] == entity]
+        entity_agg = entity_invoices.groupby('partner_name').agg(
+            omzet=('netto_omzet', 'sum'),
+            facturen=('id', lambda x: len(entity_invoices.loc[x.index][entity_invoices.loc[x.index, 'move_type'] == 'out_invoice'])),
+        ).reset_index().sort_values('omzet', ascending=False)
+
+        entity_total = entity_agg['omzet'].sum()
+        with st.expander(f"🏢 {entity} - {format_currency(entity_total)} ({len(entity_agg)} klanten)", expanded=False):
+            display_entity = entity_agg.head(20).copy()
+            display_entity.columns = ['Klant', 'Omzet', 'Facturen']
+            display_entity['Omzet'] = display_entity['Omzet'].apply(format_currency)
+            st.dataframe(display_entity, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # -------------------------------------------------------------------------
+    # SECTIE 6: BETAALGEDRAG & AGING ANALYSE
+    # -------------------------------------------------------------------------
+    st.subheader("⏰ Betaalgedrag & Debiteurenanalyse")
+
+    # Betaalstatus per klant
+    payment_summary = df.groupby(['partner_name', 'payment_state']).size().unstack(fill_value=0).reset_index()
+    payment_map = {
+        'not_paid': 'Niet betaald', 'partial': 'Deels betaald',
+        'paid': 'Betaald', 'in_payment': 'In betaling', 'reversed': 'Teruggedraaid'
+    }
+
+    # Openstaande debiteuren per klant
+    open_df = df[df['amount_residual'] > 0].copy()
+    if not open_df.empty:
+        today = pd.Timestamp.now()
+        open_df['days_overdue'] = (today - open_df['invoice_date_due']).dt.days
+        open_df['days_overdue'] = open_df['days_overdue'].clip(lower=0)
+
+        # Aging buckets
+        def aging_bucket(days):
+            if days <= 0:
+                return 'Niet vervallen'
+            elif days <= 30:
+                return '1-30 dagen'
+            elif days <= 60:
+                return '31-60 dagen'
+            elif days <= 90:
+                return '61-90 dagen'
+            else:
+                return '90+ dagen'
+
+        open_df['aging'] = open_df['days_overdue'].apply(aging_bucket)
+
+        # KPIs
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("📥 Totaal Openstaand", format_currency(open_df['amount_residual'].sum()))
+        with col2:
+            avg_days = open_df['days_overdue'].mean()
+            st.metric("📅 Gem. Dagen Openstaand", f"{avg_days:.0f} dagen")
+        with col3:
+            overdue_90 = open_df[open_df['days_overdue'] > 90]['amount_residual'].sum()
+            st.metric("🔴 > 90 Dagen", format_currency(overdue_90))
+        with col4:
+            num_overdue_customers = open_df[open_df['days_overdue'] > 0]['partner_id_num'].nunique()
+            st.metric("⚠️ Klanten met Achterstand", f"{num_overdue_customers}")
+
+        # Aging chart
+        aging_summary = open_df.groupby('aging')['amount_residual'].sum().reset_index()
+        aging_order = ['Niet vervallen', '1-30 dagen', '31-60 dagen', '61-90 dagen', '90+ dagen']
+        aging_summary['aging'] = pd.Categorical(aging_summary['aging'], categories=aging_order, ordered=True)
+        aging_summary = aging_summary.sort_values('aging')
+
+        fig_aging = px.bar(
+            aging_summary, x='aging', y='amount_residual',
+            title='Debiteurenanalyse - Aging Overzicht',
+            labels={'aging': 'Categorie', 'amount_residual': 'Openstaand (€)'},
+            color='aging',
+            color_discrete_map={
+                'Niet vervallen': '#4CAF50',
+                '1-30 dagen': '#FFC107',
+                '31-60 dagen': '#FF9800',
+                '61-90 dagen': '#FF5722',
+                '90+ dagen': '#F44336'
+            },
+            text=aging_summary['amount_residual'].apply(lambda x: format_currency(x))
+        )
+        fig_aging.update_traces(textposition='outside')
+        st.plotly_chart(fig_aging, use_container_width=True)
+
+        # Aging per klant tabel
+        with st.expander("📋 Openstaand per Klant (Detail)", expanded=False):
+            aging_pivot = open_df.pivot_table(
+                values='amount_residual',
+                index='partner_name',
+                columns='aging',
+                aggfunc='sum',
+                fill_value=0
+            ).reset_index()
+
+            # Zorg voor alle kolommen
+            for col in aging_order:
+                if col not in aging_pivot.columns:
+                    aging_pivot[col] = 0
+
+            aging_pivot['Totaal'] = aging_pivot[aging_order].sum(axis=1)
+            aging_pivot = aging_pivot.sort_values('Totaal', ascending=False)
+            aging_pivot = aging_pivot[['partner_name'] + aging_order + ['Totaal']]
+            aging_pivot.columns = ['Klant'] + aging_order + ['Totaal']
+
+            for col in aging_order + ['Totaal']:
+                aging_pivot[col] = aging_pivot[col].apply(format_currency)
+
+            st.dataframe(aging_pivot, use_container_width=True, hide_index=True)
+
+        # Top 10 klanten met langst openstaand
+        with st.expander("🔴 Top 10 Klanten met Hoogste Openstaand Bedrag", expanded=False):
+            top_debtors = open_df.groupby('partner_name').agg(
+                totaal_open=('amount_residual', 'sum'),
+                aantal_facturen=('id', 'count'),
+                max_dagen=('days_overdue', 'max'),
+                gem_dagen=('days_overdue', 'mean')
+            ).reset_index().nlargest(10, 'totaal_open')
+            top_debtors.columns = ['Klant', 'Totaal Openstaand', '# Facturen', 'Max Dagen', 'Gem. Dagen']
+            top_debtors['Totaal Openstaand'] = top_debtors['Totaal Openstaand'].apply(format_currency)
+            top_debtors['Max Dagen'] = top_debtors['Max Dagen'].apply(lambda x: f"{x:.0f}")
+            top_debtors['Gem. Dagen'] = top_debtors['Gem. Dagen'].apply(lambda x: f"{x:.0f}")
+            st.dataframe(top_debtors, use_container_width=True, hide_index=True)
+    else:
+        st.success("Geen openstaande debiteuren - alle facturen zijn betaald!")
+
+    st.markdown("---")
+
+    # -------------------------------------------------------------------------
+    # SECTIE 7: NIEUWE vs TERUGKERENDE KLANTEN
+    # -------------------------------------------------------------------------
+    st.subheader("🔄 Nieuwe vs. Terugkerende Klanten")
+
+    if not df.empty:
+        df_sorted = df.sort_values('invoice_date')
+        first_invoice = df_sorted.groupby('partner_id_num')['invoice_date'].first().reset_index()
+        first_invoice.columns = ['partner_id_num', 'first_date']
+        first_invoice['first_month'] = first_invoice['first_date'].dt.to_period('M').astype(str)
+
+        # Klanten per maand: nieuw vs terugkerend
+        monthly_customers = df.groupby('month')['partner_id_num'].apply(set).reset_index()
+        monthly_customers.columns = ['month', 'customers']
+
+        new_customers_per_month = first_invoice.groupby('first_month').size().reset_index()
+        new_customers_per_month.columns = ['Maand', 'Nieuwe Klanten']
+
+        monthly_unique = df.groupby('month')['partner_id_num'].nunique().reset_index()
+        monthly_unique.columns = ['Maand', 'Totaal Actief']
+
+        retention = monthly_unique.merge(new_customers_per_month, on='Maand', how='left').fillna(0)
+        retention['Nieuwe Klanten'] = retention['Nieuwe Klanten'].astype(int)
+        retention['Terugkerend'] = retention['Totaal Actief'] - retention['Nieuwe Klanten']
+
+        fig_retention = go.Figure()
+        fig_retention.add_trace(go.Bar(
+            x=retention['Maand'], y=retention['Terugkerend'],
+            name='Terugkerend', marker_color='#2196F3'
+        ))
+        fig_retention.add_trace(go.Bar(
+            x=retention['Maand'], y=retention['Nieuwe Klanten'],
+            name='Nieuw', marker_color='#4CAF50'
+        ))
+        fig_retention.update_layout(
+            title='Actieve Klanten per Maand (Nieuw vs. Terugkerend)',
+            barmode='stack',
+            xaxis_title='Maand',
+            yaxis_title='Aantal Klanten',
+            legend=dict(orientation='h', yanchor='bottom', y=1.02)
+        )
+        st.plotly_chart(fig_retention, use_container_width=True)
+
+        # Klant frequentie analyse
+        col1, col2 = st.columns(2)
+        with col1:
+            freq = customer_summary['aantal_facturen'].describe()
+            st.markdown("**Factuurfrequentie Statistieken:**")
+            st.markdown(f"- Gemiddeld: **{freq['mean']:.1f}** facturen per klant")
+            st.markdown(f"- Mediaan: **{freq['50%']:.0f}** facturen per klant")
+            st.markdown(f"- Maximum: **{freq['max']:.0f}** facturen")
+            eenmalig = len(customer_summary[customer_summary['aantal_facturen'] == 1])
+            st.markdown(f"- Eenmalige klanten: **{eenmalig}** ({eenmalig/total_customers*100:.1f}%)")
+
+        with col2:
+            # Frequentie distributie
+            freq_bins = customer_summary['aantal_facturen'].value_counts().sort_index().reset_index()
+            freq_bins.columns = ['Aantal Facturen', 'Aantal Klanten']
+            fig_freq = px.bar(
+                freq_bins.head(20), x='Aantal Facturen', y='Aantal Klanten',
+                title='Verdeling Factuurfrequentie per Klant',
+                color_discrete_sequence=['#FF9800']
+            )
+            st.plotly_chart(fig_freq, use_container_width=True)
+
+    st.markdown("---")
+
+    # -------------------------------------------------------------------------
+    # SECTIE 8: INDIVIDUELE KLANT DRILL-DOWN
+    # -------------------------------------------------------------------------
+    st.subheader("🔍 Klant Drill-down")
+
+    # Klant selector
+    customer_options = customer_summary.sort_values('omzet_excl', ascending=False)
+    customer_list = customer_options.apply(
+        lambda r: f"{r['partner_name']} ({format_currency(r['omzet_excl'])})", axis=1
+    ).tolist()
+    customer_id_map = dict(zip(customer_list, customer_options['partner_id_num'].tolist()))
+
+    selected_customer = st.selectbox(
+        "Selecteer klant voor detail analyse:",
+        options=customer_list,
+        index=None,
+        placeholder="Kies een klant...",
+        key="customer_drilldown"
+    )
+
+    if selected_customer:
+        sel_partner_id = customer_id_map[selected_customer]
+        cust_df = df[df['partner_id_num'] == sel_partner_id].copy()
+        cust_name = cust_df['partner_name'].iloc[0]
+
+        st.markdown(f"### 📊 Analyse: {cust_name}")
+
+        # Klant KPIs
+        cust_revenue = cust_df['netto_omzet'].sum()
+        cust_invoices = len(cust_df[cust_df['move_type'] == 'out_invoice'])
+        cust_credits = len(cust_df[cust_df['move_type'] == 'out_refund'])
+        cust_open = cust_df['amount_residual'].sum()
+        cust_first = cust_df['invoice_date'].min()
+        cust_last = cust_df['invoice_date'].max()
+        cust_avg = cust_revenue / cust_invoices if cust_invoices > 0 else 0
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("💰 Totale Omzet", format_currency(cust_revenue))
+        with col2:
+            st.metric("📄 Facturen / Credits", f"{cust_invoices} / {cust_credits}")
+        with col3:
+            st.metric("📊 Gem. Factuurwaarde", format_currency(cust_avg))
+        with col4:
+            st.metric("📥 Openstaand", format_currency(cust_open))
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("📅 Eerste Factuur", cust_first.strftime('%d-%m-%Y'))
+        with col2:
+            st.metric("📅 Laatste Factuur", cust_last.strftime('%d-%m-%Y'))
+        with col3:
+            months_active = max(1, (cust_last - cust_first).days / 30)
+            st.metric("📊 Gem. per Maand", format_currency(cust_revenue / months_active))
+        with col4:
+            rank = customer_summary[customer_summary['partner_id_num'] == sel_partner_id]['ranking'].values[0]
+            st.metric("🏆 Ranking", f"#{rank} van {total_customers}")
+
+        # Maandelijkse omzet trend
+        cust_monthly = cust_df.groupby('month')['netto_omzet'].sum().reset_index()
+        fig_cust_trend = px.bar(
+            cust_monthly, x='month', y='netto_omzet',
+            title=f'Maandelijkse Omzet - {cust_name}',
+            labels={'month': 'Maand', 'netto_omzet': 'Omzet (€)'},
+            color_discrete_sequence=['#2196F3'],
+            text=cust_monthly['netto_omzet'].apply(lambda x: format_currency(x))
+        )
+        fig_cust_trend.update_traces(textposition='outside', textfont_size=9)
+        st.plotly_chart(fig_cust_trend, use_container_width=True)
+
+        # Per entiteit
+        cust_entities = cust_df.groupby('company_name')['netto_omzet'].sum().reset_index()
+        if len(cust_entities) > 1:
+            fig_cust_entity = px.pie(
+                cust_entities, values='netto_omzet', names='company_name',
+                title=f'Omzet Verdeling per Entiteit - {cust_name}',
+                color_discrete_sequence=px.colors.qualitative.Set2
+            )
+            st.plotly_chart(fig_cust_entity, use_container_width=True)
+
+        # Facturen tabel
+        with st.expander(f"📋 Alle Facturen - {cust_name}", expanded=False):
+            cust_display = cust_df[[
+                'name', 'invoice_date', 'invoice_date_due', 'move_type',
+                'amount_untaxed', 'amount_tax', 'amount_total',
+                'amount_residual', 'payment_state', 'company_name'
+            ]].copy()
+            cust_display['move_type'] = cust_display['move_type'].map({
+                'out_invoice': 'Factuur', 'out_refund': 'Creditnota'
+            })
+            cust_display['payment_state'] = cust_display['payment_state'].map({
+                'not_paid': '🔴 Niet betaald', 'partial': '🟡 Deels',
+                'paid': '🟢 Betaald', 'in_payment': '🔵 In betaling',
+                'reversed': '⚪ Teruggedraaid'
+            })
+            cust_display['invoice_date'] = pd.to_datetime(cust_display['invoice_date']).dt.strftime('%d-%m-%Y')
+            cust_display['invoice_date_due'] = pd.to_datetime(cust_display['invoice_date_due']).dt.strftime('%d-%m-%Y')
+            cust_display.columns = [
+                'Factuurnr', 'Datum', 'Vervaldatum', 'Type',
+                'Excl. BTW', 'BTW', 'Incl. BTW',
+                'Openstaand', 'Status', 'Entiteit'
+            ]
+            for col in ['Excl. BTW', 'BTW', 'Incl. BTW', 'Openstaand']:
+                cust_display[col] = cust_display[col].apply(format_currency)
+            st.dataframe(cust_display, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # -------------------------------------------------------------------------
+    # SECTIE 9: EXPORT OVERZICHT
+    # -------------------------------------------------------------------------
+    st.subheader("📥 Export")
+
+    # Volledige klantlijst voor export
+    export_df = customer_summary[[
+        'ranking', 'partner_name', 'omzet_excl', 'omzet_incl', 'btw',
+        'aantal_facturen', 'aantal_credits', 'gem_factuur', 'openstaand',
+        'omzet_aandeel', 'eerste_factuur', 'laatste_factuur'
+    ]].copy()
+    export_df.columns = [
+        'Ranking', 'Klant', 'Omzet Excl. BTW', 'Omzet Incl. BTW', 'BTW',
+        'Aantal Facturen', 'Aantal Creditnotas', 'Gem. Factuurwaarde', 'Openstaand',
+        'Omzet Aandeel %', 'Eerste Factuur', 'Laatste Factuur'
+    ]
+
+    csv = export_df.to_csv(index=False, sep=';', decimal=',')
+    st.download_button(
+        label="📥 Download Klant Omzet Overzicht (CSV)",
+        data=csv,
+        file_name=f"klant_omzet_{date_from}_{date_to}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -1587,7 +2254,8 @@ def main():
     # Tabs
     tabs = st.tabs([
         "📊 Overzicht",
-        "📈 Winst & Verlies", 
+        "👥 Klant Omzet",
+        "📈 Winst & Verlies",
         "📋 Balans",
         "🔄 Intercompany",
         "🧾 BTW Analyse",
@@ -1596,32 +2264,35 @@ def main():
         "💹 Cashflow",
         "📦 Producten"
     ])
-    
+
     with tabs[0]:
         render_overview(company_id, date_from, date_to)
-    
+
     with tabs[1]:
-        render_profit_loss(company_id, date_from, date_to)
-    
+        render_customer_revenue(company_id, date_from, date_to)
+
     with tabs[2]:
-        render_balance_sheet(company_id, date_from, date_to)
-    
+        render_profit_loss(company_id, date_from, date_to)
+
     with tabs[3]:
-        render_intercompany(company_id, date_from, date_to)
-    
+        render_balance_sheet(company_id, date_from, date_to)
+
     with tabs[4]:
-        render_vat_analysis(company_id, date_from, date_to)
-    
+        render_intercompany(company_id, date_from, date_to)
+
     with tabs[5]:
-        render_invoices(company_id, date_from, date_to)
-    
+        render_vat_analysis(company_id, date_from, date_to)
+
     with tabs[6]:
-        render_bank(company_id, date_from, date_to)
-    
+        render_invoices(company_id, date_from, date_to)
+
     with tabs[7]:
-        render_cashflow(company_id, date_from, date_to)
-    
+        render_bank(company_id, date_from, date_to)
+
     with tabs[8]:
+        render_cashflow(company_id, date_from, date_to)
+
+    with tabs[9]:
         render_products(company_id, date_from, date_to)
 
 if __name__ == "__main__":
